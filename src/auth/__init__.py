@@ -1,0 +1,3 @@
+"""
+OmniSight-AI Authentication Package.
+"""
