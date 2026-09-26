@@ -19,6 +19,8 @@ from src.exam.service import (
     get_attempt_answers,
     save_answer,
     submit_attempt,
+    evaluate_attempt,
+    get_attempt_result,
 )
 
 
@@ -284,6 +286,25 @@ def _on_save_and_next(
 def _on_palette_jump(index_key: str, target_idx: int) -> None:
     """Callback triggered to jump directly to a target question from the palette."""
     st.session_state[index_key] = target_idx
+
+
+def _on_go_to_review(
+    attempt_id: int,
+    student_id: int,
+    qid: int,
+    widget_key: str,
+    cache_key: str,
+) -> None:
+    """Callback triggered to ensure current answer is saved and navigate to review screen."""
+    selected = st.session_state.get(widget_key)
+    if selected in {"A", "B", "C", "D"}:
+        try:
+            save_answer(attempt_id, student_id, qid, selected)
+            if cache_key in st.session_state:
+                st.session_state[cache_key][qid] = selected
+        except Exception as e:
+            st.session_state["active_exam_error"] = f"Failed to save answer: {str(e)}"
+    st.session_state["student_view"] = "review_exam"
 
 
 def _render_countdown_timer(
@@ -702,10 +723,10 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
             )
         else:
             st.button(
-                "Save Answer",
-                key=f"save_btn_{attempt_id}_{qid}",
+                "Review & Submit Exam →",
+                key=f"review_final_btn_{attempt_id}_{qid}",
                 type="primary",
-                on_click=_on_radio_select,
+                on_click=_on_go_to_review,
                 args=(attempt_id, student_id, qid, widget_key, cache_key),
                 use_container_width=True,
             )
@@ -756,16 +777,338 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
                 )
 
     st.write("")
-    if st.button("Exit to Catalog", key=f"exit_active_{attempt_id}"):
-        st.session_state["student_view"] = "catalog"
+    col_rev_main, col_exit = st.columns([2, 1])
+    with col_rev_main:
+        st.button(
+            "🏁 Review & Submit Examination",
+            key=f"palette_review_btn_{attempt_id}",
+            type="primary",
+            on_click=_on_go_to_review,
+            args=(attempt_id, student_id, qid, widget_key, cache_key),
+            use_container_width=True,
+            help="Review all answered and unanswered questions before confirming submission.",
+        )
+    with col_exit:
+        if st.button("Exit to Catalog", key=f"exit_active_{attempt_id}", use_container_width=True):
+            st.session_state["student_view"] = "catalog"
+            st.rerun()
+
+
+def render_exam_review(student_id: int, attempt_id: Optional[int]) -> None:
+    """
+    Render the pre-submission review and confirmation interface.
+    Displays summary statistics (total, answered, unanswered), question-by-question
+    answer states with navigation jump links, irreversible submission warning,
+    and enforces authoritative backend server-side timing and grace periods.
+
+    Args:
+        student_id: User ID of the authenticated student.
+        attempt_id: Active attempt ID from session state.
+    """
+    if not attempt_id:
+        st.warning("No active examination session found. Returning to catalog.")
+        if st.button("Return to Catalog", key="no_active_attempt_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.rerun()
+        return
+
+    try:
+        attempt = get_attempt(attempt_id, student_id)
+    except ValueError as e:
+        st.error(f"Examination attempt error: {str(e)}")
+        if st.button("Return to Catalog", key="val_err_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+    except PermissionError as e:
+        st.error(f"Unauthorized Access: {str(e)}")
+        if st.button("Return to Catalog", key="perm_err_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+    except Exception as e:
+        st.error(f"Failed to load examination attempt: {str(e)}")
+        if st.button("Return to Catalog", key="gen_err_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    attempt_status = attempt.get("status")
+    if attempt_status in {"SUBMITTED", "EVALUATED"}:
+        st.session_state["view_result_attempt_id"] = attempt_id
+        st.session_state["student_view"] = "result"
         st.rerun()
+        return
+
+    if attempt_status != "IN_PROGRESS":
+        st.error(f"Examination attempt has invalid status '{attempt_status}'.")
+        if st.button("Return to Catalog", key="invalid_status_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    exam_id = attempt["exam_id"]
+    try:
+        exam = get_exam(exam_id)
+    except Exception as e:
+        st.error(f"Failed to load examination details: {str(e)}")
+        if st.button("Return to Catalog", key="exam_load_err_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    if not exam:
+        st.error(f"Associated examination with ID {exam_id} could not be found.")
+        if st.button("Return to Catalog", key="missing_exam_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    # Authoritative backend server-side timing validation
+    started_at = attempt["started_at"]
+    duration_minutes = exam.get("duration_minutes", 0)
+    official_deadline = started_at + timedelta(minutes=duration_minutes)
+    grace_deadline = official_deadline + timedelta(seconds=60)
+    now = datetime.now()
+
+    # Hard cutoff: only past the 60-second grace window
+    if now > grace_deadline:
+        auto_submit_key = f"auto_submit_handled_{attempt_id}"
+        if not st.session_state.get(auto_submit_key, False):
+            st.session_state[auto_submit_key] = True
+            try:
+                submit_attempt(attempt_id, student_id)
+                evaluate_attempt(attempt_id, student_id)
+            except Exception:
+                pass
+        st.session_state["student_flash_msg"] = (
+            "Your examination time expired while reviewing. Your attempt has been automatically submitted and evaluated."
+        )
+        st.session_state["active_attempt_id"] = None
+        st.session_state["view_result_attempt_id"] = attempt_id
+        st.session_state["student_view"] = "result"
+        st.rerun()
+        return
+
+    remaining_seconds = int((official_deadline - now).total_seconds())
+    grace_remaining_seconds = max(0, int((grace_deadline - now).total_seconds()))
+    in_grace_window = (now > official_deadline) and (now <= grace_deadline)
+
+    try:
+        questions = get_attempt_questions(attempt_id, student_id)
+    except Exception as e:
+        st.error(f"Failed to retrieve questions for attempt: {str(e)}")
+        if st.button("Return to Catalog", key="q_err_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    if not questions:
+        st.warning("This examination currently contains no questions. Please contact your instructor.")
+        if st.button("Return to Catalog", key="empty_questions_review_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.rerun()
+        return
+
+    try:
+        answers = get_attempt_answers(attempt_id, student_id)
+    except Exception:
+        answers = {}
+
+    cache_key = f"attempt_answers_{attempt_id}"
+    st.session_state[cache_key] = answers
+
+    total_q = len(questions)
+    answered_q = sum(1 for q in questions if answers.get(q["question_id"]) is not None)
+    unanswered_q = total_q - answered_q
+
+    # Review Screen Context Header
+    col_title, col_badge = st.columns([3, 1])
+    with col_title:
+        st.subheader("🏁 Examination Submission Review")
+        st.markdown(f"**{exam.get('title', 'Examination')}**")
+        if exam.get("description"):
+            st.caption(exam["description"])
+    with col_badge:
+        st.markdown(
+            f"<div style='text-align: right; margin-top: 8px; font-weight: bold; color: #FB8C00;'>"
+            f"ATTEMPT #{attempt_id} (REVIEW)"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # Visual urgency and grace window alerts
+    if in_grace_window:
+        st.error(
+            f"⏰ Official examination time has concluded. You are in the 60-second grace window "
+            f"({grace_remaining_seconds}s remaining). Submit your examination immediately before the hard cutoff."
+        )
+    elif 0 < remaining_seconds <= 60:
+        st.error("🚨 Final Minute! Less than 60 seconds remaining. Your attempt will be automatically submitted when time expires.")
+    elif 0 < remaining_seconds <= 300:
+        st.warning("⚠️ Attention: Less than 5 minutes remaining. Please finalize your submission.")
+
+    col_info, col_timer = st.columns([3, 2])
+    with col_info:
+        st.caption("Review your answered and unanswered questions before confirming your final submission.")
+    with col_timer:
+        _render_countdown_timer(
+            official_deadline,
+            grace_deadline,
+            remaining_seconds,
+            grace_remaining_seconds,
+        )
+
+    # Irreversible Warning Notice
+    st.warning(
+        "⚠️ **Final Submission Warning**: Submitting your examination is permanent and irreversible. "
+        "Once submitted, you cannot change any answers or resume this attempt. "
+        "Please review your answers carefully before confirming."
+    )
+
+    # Metrics Summary Cards
+    col_tot, col_ans, col_unans = st.columns(3)
+    col_tot.metric("Total Questions", total_q)
+    col_ans.metric("Answered Questions", f"{answered_q} / {total_q}")
+    col_unans.metric("Unanswered Questions", unanswered_q)
+
+    # Completion State Callouts
+    if unanswered_q == 0:
+        st.success(f"✅ All {total_q} questions have been answered. You are ready to finalize and submit your examination.")
+    elif answered_q > 0:
+        st.warning(f"⚠️ You have {unanswered_q} unanswered question(s) out of {total_q}. Any unanswered questions will receive 0 marks.")
+    else:
+        st.error(f"🚨 Critical Alert: You have NOT answered any questions (0 / {total_q}). Submitting now will finalize your attempt with an obtained score of 0.0 marks.")
+
+    st.divider()
+    st.markdown("### Question Breakdown")
+
+    # Question Breakdown List
+    for idx, q in enumerate(questions):
+        q_id = q["question_id"]
+        saved_option = answers.get(q_id)
+        is_ans = (saved_option is not None)
+
+        with st.container(border=True):
+            col_qnum, col_qtxt, col_status, col_btn = st.columns([1, 4, 2, 2])
+            with col_qnum:
+                st.markdown(f"**Question {idx + 1}**")
+                marks = q.get("marks", 1)
+                st.caption(f"{marks} Mark{'s' if marks != 1 else ''}")
+            with col_qtxt:
+                q_text = q.get("question_text", "")
+                if len(q_text) > 75:
+                    q_text = q_text[:72] + "..."
+                st.markdown(q_text)
+            with col_status:
+                if is_ans:
+                    st.markdown(
+                        f"<div style='color: #2E7D32; font-weight: bold; padding-top: 6px;'>"
+                        f"✓ Option {saved_option}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        "<div style='color: #D32F2F; font-weight: bold; padding-top: 6px;'>"
+                        "⚠️ Unanswered"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
+            with col_btn:
+                btn_txt = f"Edit Q{idx + 1}" if is_ans else f"Answer Q{idx + 1}"
+                if st.button(btn_txt, key=f"rev_jump_{attempt_id}_{q_id}", use_container_width=True):
+                    st.session_state[f"q_index_{attempt_id}"] = idx
+                    st.session_state["student_view"] = "active_exam"
+                    st.rerun()
+
+    st.divider()
+
+    # Zero-answered confirmation guard
+    submit_disabled = False
+    if answered_q == 0:
+        ack_key = f"ack_empty_submit_{attempt_id}"
+        ack = st.checkbox(
+            "I acknowledge that I am submitting an empty examination with 0 answers and will receive 0 marks.",
+            key=ack_key,
+        )
+        if not ack:
+            submit_disabled = True
+
+    # Action Buttons Row
+    col_ret, col_sub = st.columns([1, 2])
+    with col_ret:
+        if st.button("← Return to Exam", key=f"rev_return_btn_{attempt_id}", use_container_width=True):
+            st.session_state["student_view"] = "active_exam"
+            st.rerun()
+
+    with col_sub:
+        submit_btn_label = "Finalize & Submit Exam Now" if in_grace_window else "Confirm & Submit Examination"
+        if st.button(
+            submit_btn_label,
+            key=f"rev_submit_btn_{attempt_id}",
+            type="primary",
+            disabled=submit_disabled,
+            use_container_width=True,
+        ):
+            try:
+                submit_attempt(attempt_id, student_id)
+            except ValueError as e:
+                st.error(f"Submission failed: {str(e)}")
+                try:
+                    att_check = get_attempt(attempt_id, student_id)
+                    if att_check.get("status") in {"SUBMITTED", "EVALUATED"}:
+                        st.session_state["active_attempt_id"] = None
+                        st.session_state["view_result_attempt_id"] = attempt_id
+                        st.session_state["student_view"] = "result"
+                        st.rerun()
+                        return
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                st.error(f"An unexpected error occurred during submission: {str(e)}")
+                return
+
+            eval_success = True
+            try:
+                evaluate_attempt(attempt_id, student_id)
+            except Exception:
+                eval_success = False
+
+            # Cleanup session state
+            st.session_state.pop(f"attempt_answers_{attempt_id}", None)
+            st.session_state.pop(f"q_index_{attempt_id}", None)
+            st.session_state.pop(f"auto_submit_handled_{attempt_id}", None)
+            st.session_state.pop(f"ack_empty_submit_{attempt_id}", None)
+            st.session_state["active_attempt_id"] = None
+            st.session_state["view_result_attempt_id"] = attempt_id
+            st.session_state["student_view"] = "result"
+            if eval_success:
+                st.session_state["student_flash_msg"] = (
+                    "🎉 Examination submitted and evaluated successfully!"
+                )
+            else:
+                st.session_state["student_flash_msg"] = (
+                    "Examination submitted successfully. Results evaluation is pending."
+                )
+            st.rerun()
 
 
 def render_student_ui() -> None:
     """
     Main entrypoint for the Student Exam Portal presentation layer.
     Enforces student role requirement and manages view routing across catalog,
-    instructions, active exam, and result displays.
+    instructions, active exam, review exam, and result displays.
     """
     if not require_role(["student"]):
         st.error("Access Denied: You must be signed in as a student to access the examination portal.")
@@ -796,15 +1139,30 @@ def render_student_ui() -> None:
         active_attempt_id = st.session_state.get("active_attempt_id")
         render_active_exam(user["id"], active_attempt_id)
 
+    elif view == "review_exam":
+        active_attempt_id = st.session_state.get("active_attempt_id")
+        render_exam_review(user["id"], active_attempt_id)
+
     elif view == "result":
         attempt_id = st.session_state.get("view_result_attempt_id")
         st.subheader("Examination Result")
-        st.info(
-            f"Viewing results for attempt ID: {attempt_id}.\n\n"
-            "The comprehensive result scorecard interface will be implemented in Step 3 Part 2C."
-        )
+        if attempt_id:
+            try:
+                res = get_attempt_result(attempt_id, user["id"])
+                st.success(
+                    f"Attempt #{attempt_id} has been evaluated!\n\n"
+                    f"**Score:** {res['obtained_marks']} / {res['total_marks']} ({res['percentage']}%)"
+                )
+            except Exception:
+                st.info(
+                    f"Viewing results for attempt ID: {attempt_id}.\n\n"
+                    "The comprehensive result scorecard interface will be implemented in Step 3 Part 2C."
+                )
+        else:
+            st.info("No active result selected.")
         if st.button("Return to Catalog", key="return_from_result"):
             st.session_state["student_view"] = "catalog"
+            st.session_state["view_result_attempt_id"] = None
             st.rerun()
 
     else:
