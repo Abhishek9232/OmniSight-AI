@@ -4,6 +4,7 @@ Handles teacher exam CRUD, lifecycle management, and validation.
 """
 
 from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta
 import mysql.connector
 from src.database.connection import get_connection
 
@@ -777,6 +778,692 @@ def delete_question(question_id: int, teacher_id: int) -> bool:
         if conn:
             conn.rollback()
         raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def start_attempt(exam_id: int, student_id: int) -> Dict[str, Any]:
+    """
+    Initiate a new examination attempt for an authenticated student.
+
+    Args:
+        exam_id: Unique exam identifier.
+        student_id: User ID of the student.
+
+    Returns:
+        Dict containing attempt details (attempt_id, exam_id, student_id, started_at, submitted_at, status).
+
+    Raises:
+        ValueError: If exam or student does not exist, exam is not PUBLISHED, or attempt already exists.
+        PermissionError: If user does not have the student role.
+    """
+    if not isinstance(exam_id, int) or exam_id <= 0:
+        raise ValueError("Valid exam ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Validate that the student/user exists & 2. Role is strictly student
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot start examination attempts.")
+
+    # 3. Validate that the exam exists
+    exam = get_exam(exam_id)
+    if not exam:
+        raise ValueError(f"Exam with ID {exam_id} not found.")
+
+    # 4. Validate that the exam status is PUBLISHED
+    if exam["status"] != "PUBLISHED":
+        raise ValueError(f"Cannot start attempt: Exam status is '{exam['status']}'. Only PUBLISHED exams can be attempted.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 5. Enforce MVP single-attempt policy
+        check_query = """
+            SELECT attempt_id, status FROM exam_attempts
+            WHERE exam_id = %s AND student_id = %s
+            LIMIT 1;
+        """
+        cursor.execute(check_query, (exam_id, student_id))
+        existing_attempt = cursor.fetchone()
+        if existing_attempt:
+            raise ValueError("You have already initiated or completed an attempt for this examination.")
+
+        # 6. Create row in exam_attempts
+        insert_query = """
+            INSERT INTO exam_attempts (exam_id, student_id, started_at, submitted_at, status)
+            VALUES (%s, %s, NOW(), NULL, 'IN_PROGRESS');
+        """
+        cursor.execute(insert_query, (exam_id, student_id))
+        attempt_id = cursor.lastrowid
+
+        # 7. Retrieve the newly created attempt record
+        select_query = """
+            SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status
+            FROM exam_attempts
+            WHERE attempt_id = %s
+            LIMIT 1;
+        """
+        cursor.execute(select_query, (attempt_id,))
+        created_attempt = cursor.fetchone()
+
+        conn.commit()
+
+        if not created_attempt:
+            raise RuntimeError("Failed to retrieve created examination attempt.")
+
+        return created_attempt
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def get_attempt(attempt_id: int, student_id: int) -> Dict[str, Any]:
+    """
+    Retrieve an examination attempt belonging to an authenticated student.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the requesting student.
+
+    Returns:
+        Dict containing attempt details (attempt_id, exam_id, student_id, started_at, submitted_at, status).
+
+    Raises:
+        ValueError: If parameters are invalid, student not found, or attempt not found.
+        PermissionError: If user does not have student role, or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Verify that the student exists & 2. Verify user has the STUDENT role
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access student attempt details.")
+
+    # 3. Fetch the attempt by attempt_id
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status
+            FROM exam_attempts
+            WHERE attempt_id = %s
+            LIMIT 1;
+        """
+        cursor.execute(query, (attempt_id,))
+        attempt = cursor.fetchone()
+
+        # 5. If the attempt does not exist, raise an appropriate ValueError
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 4 & 6. Verify that the attempt belongs to the supplied student_id
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to access this examination attempt.")
+
+        # 7. Return only safe attempt-level fields
+        return attempt
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def get_attempt_questions(attempt_id: int, student_id: int) -> List[Dict[str, Any]]:
+    """
+    Retrieve all questions for an examination attempt, strictly masking answer keys.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the student.
+
+    Returns:
+        List of dicts containing student-safe question fields:
+        (question_id, question_text, option_a, option_b, option_c, option_d, marks).
+
+    Raises:
+        ValueError: If IDs are invalid, student not found, attempt not found, or exam not found.
+        PermissionError: If user is not a student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Verify that the student exists & 2. Verify caller has STUDENT role
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access student attempt questions.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 3. Fetch attempt by attempt_id
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 4 & 5. Verify that the attempt belongs to student_id
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to access questions for this examination attempt.")
+
+        # 6. Verify associated exam exists
+        exam = get_exam(attempt["exam_id"])
+        if not exam:
+            raise ValueError(f"Associated exam with ID {attempt['exam_id']} not found.")
+
+        # 7, 8, 9, 10, 11: Fetch questions for that exam ordered by question_id ASC, strictly excluding correct_option
+        query = """
+            SELECT question_id, question_text, option_a, option_b, option_c, option_d, marks
+            FROM questions
+            WHERE exam_id = %s
+            ORDER BY question_id ASC;
+        """
+        cursor.execute(query, (attempt["exam_id"],))
+        return cursor.fetchall()
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def save_answer(
+    attempt_id: int,
+    student_id: int,
+    question_id: int,
+    selected_option: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Persist or update a student's answer selection for a question.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the student.
+        question_id: Unique question identifier.
+        selected_option: Option choice ('A', 'B', 'C', 'D') or None to clear answer.
+
+    Returns:
+        Dict containing answer details (answer_id, attempt_id, question_id, selected_option, answered_at).
+
+    Raises:
+        ValueError: If validation fails (invalid option, question not in exam, expired attempt, non-existent entity).
+        PermissionError: If user is not student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    if not isinstance(question_id, int) or question_id <= 0:
+        raise ValueError("Valid question ID is required.")
+
+    # 1. Verify student exists & 2. Verify caller has STUDENT role
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot save examination answers.")
+
+    # 9. Validate selected_option
+    clean_option = None
+    if selected_option is not None:
+        if not isinstance(selected_option, str):
+            raise ValueError("Selected option must be a string or None.")
+        normalized = selected_option.strip().upper()
+        if normalized not in {"A", "B", "C", "D"}:
+            raise ValueError(f"Invalid selected option '{selected_option}'. Must be one of 'A', 'B', 'C', 'D', or None.")
+        clean_option = normalized
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 3. Fetch attempt
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 4. Verify attempt belongs to student_id
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to modify this examination attempt.")
+
+        # 5. Only allow saving answers when attempt status is IN_PROGRESS
+        if attempt["status"] != "IN_PROGRESS":
+            raise ValueError(f"Cannot save answer: Attempt status is '{attempt['status']}'. Answers can only be saved while attempt is IN_PROGRESS.")
+
+        # Fetch associated exam for timing and relationship verification
+        exam = get_exam(attempt["exam_id"])
+        if not exam:
+            raise ValueError(f"Associated exam with ID {attempt['exam_id']} not found.")
+
+        # 6. Enforce server-side timing: started_at + exam duration + 60s grace period
+        duration_minutes = exam.get("duration_minutes", 0)
+        started_at = attempt["started_at"]
+        grace_period_seconds = 60
+        deadline = started_at + timedelta(minutes=duration_minutes, seconds=grace_period_seconds)
+        now = datetime.now()
+
+        if now > deadline:
+            raise ValueError("Exam duration has expired. Answers can no longer be saved.")
+
+        # 7 & 8. Verify question exists and belongs to the exam associated with the attempt
+        cursor.execute(
+            "SELECT question_id, exam_id FROM questions WHERE question_id = %s LIMIT 1;",
+            (question_id,)
+        )
+        question = cursor.fetchone()
+        if not question:
+            raise ValueError(f"Question with ID {question_id} not found.")
+
+        if question["exam_id"] != attempt["exam_id"]:
+            raise ValueError("Question does not belong to the examination for this attempt.")
+
+        # 11 & 12. Check if answer already exists (UPSERT pattern)
+        cursor.execute(
+            "SELECT answer_id FROM answers WHERE attempt_id = %s AND question_id = %s LIMIT 1;",
+            (attempt_id, question_id)
+        )
+        existing_answer = cursor.fetchone()
+
+        if existing_answer:
+            answer_id = existing_answer["answer_id"]
+            cursor.execute(
+                "UPDATE answers SET selected_option = %s, answered_at = NOW() WHERE answer_id = %s;",
+                (clean_option, answer_id)
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO answers (attempt_id, question_id, selected_option, is_correct, answered_at) VALUES (%s, %s, %s, NULL, NOW());",
+                (attempt_id, question_id, clean_option)
+            )
+            answer_id = cursor.lastrowid
+
+        # 10. Fetch updated answer record (strictly omitting correct_option)
+        cursor.execute(
+            "SELECT answer_id, attempt_id, question_id, selected_option, answered_at FROM answers WHERE answer_id = %s LIMIT 1;",
+            (answer_id,)
+        )
+        saved_record = cursor.fetchone()
+
+        conn.commit()
+
+        if not saved_record:
+            raise RuntimeError("Failed to retrieve saved answer record.")
+
+        return saved_record
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def submit_attempt(attempt_id: int, student_id: int) -> Dict[str, Any]:
+    """
+    Finalize and submit an active examination attempt.
+
+    Transitions attempt status from IN_PROGRESS to SUBMITTED and stamps submitted_at.
+    Does NOT calculate marks or populate results (reserved for evaluate_attempt).
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the student.
+
+    Returns:
+        Dict containing safe attempt fields (attempt_id, exam_id, student_id, started_at, submitted_at, status).
+
+    Raises:
+        ValueError: If attempt or student not found, or attempt is not in IN_PROGRESS status.
+        PermissionError: If user is not student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Verify student exists & 2. Verify caller has STUDENT role
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot submit examination attempts.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 3. Fetch attempt by attempt_id
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 4. Verify attempt belongs to student_id
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to submit this examination attempt.")
+
+        # 5. Only an IN_PROGRESS attempt can be submitted
+        if attempt["status"] != "IN_PROGRESS":
+            raise ValueError(f"Cannot submit attempt: Attempt status is '{attempt['status']}'. Only IN_PROGRESS attempts can be submitted.")
+
+        # 6 & 7. Server-side timing validation: calculate deadline with 60-second grace period
+        exam = get_exam(attempt["exam_id"])
+        if not exam:
+            raise ValueError(f"Associated exam with ID {attempt['exam_id']} not found.")
+
+        duration_minutes = exam.get("duration_minutes", 0)
+        started_at = attempt["started_at"]
+        # In all cases (within limit or past deadline), finalize status to SUBMITTED
+        # so the attempt is permanently locked against further modifications.
+        cursor.execute(
+            "UPDATE exam_attempts SET status = 'SUBMITTED', submitted_at = NOW() WHERE attempt_id = %s;",
+            (attempt_id,)
+        )
+
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        submitted_record = cursor.fetchone()
+
+        conn.commit()
+
+        if not submitted_record:
+            raise RuntimeError("Failed to retrieve submitted examination attempt.")
+
+        return submitted_record
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def evaluate_attempt(attempt_id: int, student_id: int) -> Dict[str, Any]:
+    """
+    Evaluate an examination attempt, compute marks, persist results, and transition status to EVALUATED.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the student.
+
+    Returns:
+        Dict containing safe result details:
+        (result_id, attempt_id, total_marks, obtained_marks, percentage, evaluated_at, status).
+
+    Raises:
+        ValueError: If attempt or student not found, attempt is not in SUBMITTED status, or duplicate evaluation.
+        PermissionError: If user is not student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Verify student exists & 2. Verify caller has STUDENT role
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot evaluate examination attempts.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 3. Fetch attempt by attempt_id
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 4. Verify attempt belongs to student_id
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to evaluate this examination attempt.")
+
+        # 5 & 6. Only a SUBMITTED attempt can be evaluated; reject duplicate evaluation
+        if attempt["status"] == "EVALUATED":
+            raise ValueError("Cannot evaluate attempt: Attempt has already been EVALUATED.")
+        if attempt["status"] != "SUBMITTED":
+            raise ValueError(f"Cannot evaluate attempt: Attempt status is '{attempt['status']}'. Only SUBMITTED attempts can be evaluated.")
+
+        cursor.execute(
+            "SELECT result_id FROM results WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        existing_result = cursor.fetchone()
+        if existing_result:
+            raise ValueError("A result record already exists for this examination attempt.")
+
+        # 7. Fetch all questions belonging to the exam
+        cursor.execute(
+            "SELECT question_id, correct_option, marks FROM questions WHERE exam_id = %s ORDER BY question_id ASC;",
+            (attempt["exam_id"],)
+        )
+        questions = cursor.fetchall()
+        if not questions:
+            raise ValueError(f"No questions found for exam ID {attempt['exam_id']}.")
+
+        # 8. Fetch the student's answers for this attempt
+        cursor.execute(
+            "SELECT answer_id, question_id, selected_option FROM answers WHERE attempt_id = %s;",
+            (attempt_id,)
+        )
+        student_answers = cursor.fetchall()
+        answers_by_qid = {a["question_id"]: a for a in student_answers}
+
+        # 9, 10, 11. Calculate total_marks, obtained_marks, percentage
+        total_marks = 0.0
+        obtained_marks = 0.0
+
+        for q in questions:
+            q_id = q["question_id"]
+            q_marks = float(q["marks"])
+            total_marks += q_marks
+
+            ans = answers_by_qid.get(q_id)
+            if ans and ans["selected_option"]:
+                is_correct = (ans["selected_option"].strip().upper() == q["correct_option"].strip().upper())
+                cursor.execute(
+                    "UPDATE answers SET is_correct = %s WHERE answer_id = %s;",
+                    (is_correct, ans["answer_id"])
+                )
+                if is_correct:
+                    obtained_marks += q_marks
+            elif ans:
+                cursor.execute(
+                    "UPDATE answers SET is_correct = FALSE WHERE answer_id = %s;",
+                    (ans["answer_id"],)
+                )
+
+        percentage = round((obtained_marks / total_marks) * 100, 2) if total_marks > 0 else 0.0
+
+        # 13, 14, 15. Create exactly ONE result record
+        cursor.execute(
+            """
+            INSERT INTO results (attempt_id, total_marks, obtained_marks, percentage, evaluated_at)
+            VALUES (%s, %s, %s, %s, NOW());
+            """,
+            (attempt_id, total_marks, obtained_marks, percentage)
+        )
+        result_id = cursor.lastrowid
+
+        # 16. Update exam_attempts.status from SUBMITTED -> EVALUATED
+        cursor.execute(
+            "UPDATE exam_attempts SET status = 'EVALUATED' WHERE attempt_id = %s;",
+            (attempt_id,)
+        )
+
+        cursor.execute(
+            "SELECT result_id, attempt_id, total_marks, obtained_marks, percentage, evaluated_at FROM results WHERE result_id = %s LIMIT 1;",
+            (result_id,)
+        )
+        saved_result = cursor.fetchone()
+
+        # 17. Atomic commit of result creation and status update
+        conn.commit()
+
+        if not saved_result:
+            raise RuntimeError("Failed to retrieve created examination result.")
+
+        return {
+            "result_id": saved_result["result_id"],
+            "attempt_id": saved_result["attempt_id"],
+            "total_marks": float(saved_result["total_marks"]),
+            "obtained_marks": float(saved_result["obtained_marks"]),
+            "percentage": float(saved_result["percentage"]) if saved_result["percentage"] is not None else 0.0,
+            "evaluated_at": saved_result["evaluated_at"],
+            "status": "EVALUATED"
+        }
+    except Exception:
+        # 18. Rollback complete transaction on failure
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def get_attempt_result(attempt_id: int, student_id: int) -> Dict[str, Any]:
+    """
+    Retrieve finalized examination result details for an authenticated student.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the student.
+
+    Returns:
+        Dict containing safe result fields:
+        (result_id, attempt_id, total_marks, obtained_marks, percentage, evaluated_at, status).
+
+    Raises:
+        ValueError: If attempt or student not found, or attempt has not been evaluated yet.
+        PermissionError: If user is not student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Verify student exists & has role 'student'
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access student examination results.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 2. Fetch attempt by attempt_id
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 3. Verify attempt belongs to the given student_id
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to access results for this examination attempt.")
+
+        # 4 & 5. Fetch result row using attempt_id
+        cursor.execute(
+            "SELECT result_id, attempt_id, total_marks, obtained_marks, percentage, evaluated_at FROM results WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        result = cursor.fetchone()
+        if not result:
+            raise ValueError(f"No result found for attempt ID {attempt_id}. The examination attempt has not been evaluated yet.")
+
+        # 6 & 7. Return only safe result fields (no correct_option, no answer keys)
+        return {
+            "result_id": result["result_id"],
+            "attempt_id": result["attempt_id"],
+            "total_marks": float(result["total_marks"]),
+            "obtained_marks": float(result["obtained_marks"]),
+            "percentage": float(result["percentage"]) if result["percentage"] is not None else 0.0,
+            "evaluated_at": result["evaluated_at"],
+            "status": attempt["status"]
+        }
     finally:
         if cursor:
             cursor.close()
