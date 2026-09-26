@@ -12,6 +12,8 @@ from src.exam.service import (
     get_student_attempt_for_exam,
     get_exam,
     start_attempt,
+    get_attempt,
+    get_attempt_questions,
 )
 
 
@@ -222,6 +224,167 @@ def render_exam_instructions(student_id: int, exam_id: Optional[int]) -> None:
                         st.error(f"Failed to initiate examination session: {str(e)}")
 
 
+def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
+    """
+    Render the active examination interface displaying the current question and options.
+    Validates attempt ownership, status, and retrieves questions via the secure service layer.
+
+    Args:
+        student_id: User ID of the authenticated student.
+        attempt_id: Active attempt ID from session state.
+    """
+    if not attempt_id:
+        st.warning("No active examination session found. Returning to catalog.")
+        if st.button("Return to Catalog", key="no_active_attempt_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.rerun()
+        return
+
+    try:
+        attempt = get_attempt(attempt_id, student_id)
+    except ValueError as e:
+        st.error(f"Examination attempt error: {str(e)}")
+        if st.button("Return to Catalog", key="val_err_attempt_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+    except PermissionError as e:
+        st.error(f"Unauthorized Access: {str(e)}")
+        if st.button("Return to Catalog", key="perm_err_attempt_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+    except Exception as e:
+        st.error(f"Failed to load examination attempt: {str(e)}")
+        if st.button("Return to Catalog", key="gen_err_attempt_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    attempt_status = attempt.get("status")
+    if attempt_status in {"SUBMITTED", "EVALUATED"}:
+        st.session_state["view_result_attempt_id"] = attempt_id
+        st.session_state["student_view"] = "result"
+        st.rerun()
+        return
+
+    if attempt_status != "IN_PROGRESS":
+        st.error(f"Examination attempt has invalid status '{attempt_status}'.")
+        if st.button("Return to Catalog", key="invalid_status_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    exam_id = attempt["exam_id"]
+    try:
+        exam = get_exam(exam_id)
+    except Exception as e:
+        st.error(f"Failed to load examination details: {str(e)}")
+        if st.button("Return to Catalog", key="exam_load_err_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    if not exam:
+        st.error(f"Associated examination with ID {exam_id} could not be found.")
+        if st.button("Return to Catalog", key="missing_exam_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    try:
+        questions = get_attempt_questions(attempt_id, student_id)
+    except Exception as e:
+        st.error(f"Failed to retrieve questions for attempt: {str(e)}")
+        if st.button("Return to Catalog", key="q_err_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["active_attempt_id"] = None
+            st.rerun()
+        return
+
+    if not questions:
+        st.warning("This examination currently contains no questions. Please contact your instructor.")
+        if st.button("Return to Catalog", key="empty_questions_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.rerun()
+        return
+
+    index_key = f"q_index_{attempt_id}"
+    if index_key not in st.session_state:
+        st.session_state[index_key] = 0
+
+    current_idx = st.session_state[index_key]
+    if current_idx < 0:
+        current_idx = 0
+        st.session_state[index_key] = 0
+    elif current_idx >= len(questions):
+        current_idx = len(questions) - 1
+        st.session_state[index_key] = current_idx
+
+    current_q = questions[current_idx]
+
+    col_title, col_badge = st.columns([3, 1])
+    with col_title:
+        st.subheader(exam.get("title", "Examination"))
+        if exam.get("description"):
+            st.caption(exam["description"])
+    with col_badge:
+        st.markdown(
+            f"<div style='text-align: right; margin-top: 8px; font-weight: bold; color: #FB8C00;'>"
+            f"ATTEMPT #{attempt_id} (IN PROGRESS)"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    col_qnum, col_marks = st.columns([3, 1])
+    with col_qnum:
+        st.markdown(f"#### Question {current_idx + 1} of {len(questions)}")
+    with col_marks:
+        marks = current_q.get("marks", 1)
+        mark_label = "Mark" if marks == 1 else "Marks"
+        st.markdown(
+            f"<div style='text-align: right; font-weight: bold; padding-top: 4px;'>"
+            f"Points: {marks} {mark_label}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with st.container(border=True):
+        st.markdown(f"**{current_q.get('question_text', '')}**")
+        st.write("")
+
+        option_keys = ["A", "B", "C", "D"]
+        option_labels = {
+            "A": f"A. {current_q.get('option_a', '')}",
+            "B": f"B. {current_q.get('option_b', '')}",
+            "C": f"C. {current_q.get('option_c', '')}",
+            "D": f"D. {current_q.get('option_d', '')}",
+        }
+
+        widget_key = f"option_choice_{attempt_id}_{current_q['question_id']}"
+        st.radio(
+            label="Select your answer:",
+            options=option_keys,
+            format_func=lambda opt: option_labels.get(opt, opt),
+            index=None,
+            key=widget_key,
+        )
+
+    st.caption("ℹ️ Option selection persistence, question palette, and navigation controls will be enabled in Part 2B-2.")
+
+    if st.button("Exit to Catalog", key=f"exit_active_{attempt_id}"):
+        st.session_state["student_view"] = "catalog"
+        st.rerun()
+
+
 def render_student_ui() -> None:
     """
     Main entrypoint for the Student Exam Portal presentation layer.
@@ -255,15 +418,7 @@ def render_student_ui() -> None:
 
     elif view == "active_exam":
         active_attempt_id = st.session_state.get("active_attempt_id")
-        active_exam_id = st.session_state.get("active_exam_id")
-        st.subheader("Active Examination Session")
-        st.info(
-            f"Examination attempt (ID: {active_attempt_id}) is currently in progress.\n\n"
-            "The active question-taking interface will be implemented in Step 3 Part 2B."
-        )
-        if st.button("Return to Catalog", key="return_from_active"):
-            st.session_state["student_view"] = "catalog"
-            st.rerun()
+        render_active_exam(user["id"], active_attempt_id)
 
     elif view == "result":
         attempt_id = st.session_state.get("view_result_attempt_id")
