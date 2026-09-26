@@ -1006,6 +1006,65 @@ def get_attempt_questions(attempt_id: int, student_id: int) -> List[Dict[str, An
             conn.close()
 
 
+def get_attempt_answers(attempt_id: int, student_id: int) -> Dict[int, Optional[str]]:
+    """
+    Retrieve all previously saved answer selections for an examination attempt.
+    Strictly excludes evaluation marks and answer keys.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the requesting student.
+
+    Returns:
+        Dict mapping question_id -> selected_option.
+
+    Raises:
+        ValueError: If parameters are invalid or attempt not found.
+        PermissionError: If user is not student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access student attempt answers.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT attempt_id, student_id FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to access answers for this attempt.")
+
+        cursor.execute(
+            "SELECT question_id, selected_option FROM answers WHERE attempt_id = %s;",
+            (attempt_id,)
+        )
+        rows = cursor.fetchall()
+        return {row["question_id"]: row["selected_option"] for row in rows}
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
 def save_answer(
     attempt_id: int,
     student_id: int,

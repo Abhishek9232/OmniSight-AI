@@ -14,6 +14,8 @@ from src.exam.service import (
     start_attempt,
     get_attempt,
     get_attempt_questions,
+    get_attempt_answers,
+    save_answer,
 )
 
 
@@ -224,10 +226,67 @@ def render_exam_instructions(student_id: int, exam_id: Optional[int]) -> None:
                         st.error(f"Failed to initiate examination session: {str(e)}")
 
 
+def _on_radio_select(attempt_id: int, student_id: int, qid: int, widget_key: str, cache_key: str) -> None:
+    """Callback triggered whenever student selects or changes a radio option."""
+    selected = st.session_state.get(widget_key)
+    if selected in {"A", "B", "C", "D"}:
+        try:
+            save_answer(attempt_id, student_id, qid, selected)
+            if cache_key in st.session_state:
+                st.session_state[cache_key][qid] = selected
+        except Exception as e:
+            st.session_state["active_exam_error"] = f"Failed to save answer: {str(e)}"
+
+
+def _on_clear_selection(attempt_id: int, student_id: int, qid: int, widget_key: str, cache_key: str) -> None:
+    """Callback triggered to clear answer selection for the active question."""
+    try:
+        save_answer(attempt_id, student_id, qid, None)
+        if cache_key in st.session_state:
+            st.session_state[cache_key][qid] = None
+        if widget_key in st.session_state:
+            st.session_state[widget_key] = None
+    except Exception as e:
+        st.session_state["active_exam_error"] = f"Failed to clear selection: {str(e)}"
+
+
+def _on_nav_prev(index_key: str) -> None:
+    """Callback triggered to navigate to the previous question."""
+    if index_key in st.session_state and st.session_state[index_key] > 0:
+        st.session_state[index_key] -= 1
+
+
+def _on_save_and_next(
+    attempt_id: int,
+    student_id: int,
+    qid: int,
+    widget_key: str,
+    cache_key: str,
+    index_key: str,
+    max_idx: int,
+) -> None:
+    """Callback triggered to ensure current answer is saved and advance to next question."""
+    selected = st.session_state.get(widget_key)
+    if selected in {"A", "B", "C", "D"}:
+        try:
+            save_answer(attempt_id, student_id, qid, selected)
+            if cache_key in st.session_state:
+                st.session_state[cache_key][qid] = selected
+        except Exception as e:
+            st.session_state["active_exam_error"] = f"Failed to save answer: {str(e)}"
+    if index_key in st.session_state and st.session_state[index_key] < max_idx:
+        st.session_state[index_key] += 1
+
+
+def _on_palette_jump(index_key: str, target_idx: int) -> None:
+    """Callback triggered to jump directly to a target question from the palette."""
+    st.session_state[index_key] = target_idx
+
+
 def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
     """
-    Render the active examination interface displaying the current question and options.
-    Validates attempt ownership, status, and retrieves questions via the secure service layer.
+    Render the active examination interface displaying the current question, options,
+    navigation controls, and interactive question palette with answer persistence.
 
     Args:
         student_id: User ID of the authenticated student.
@@ -315,6 +374,19 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
             st.rerun()
         return
 
+    # Initialize or restore answers cache from service layer
+    cache_key = f"attempt_answers_{attempt_id}"
+    if cache_key not in st.session_state:
+        try:
+            st.session_state[cache_key] = get_attempt_answers(attempt_id, student_id)
+        except Exception:
+            st.session_state[cache_key] = {}
+    answers_cache = st.session_state[cache_key]
+
+    # Display active exam flash errors if any
+    if "active_exam_error" in st.session_state:
+        st.error(st.session_state.pop("active_exam_error"))
+
     index_key = f"q_index_{attempt_id}"
     if index_key not in st.session_state:
         st.session_state[index_key] = 0
@@ -328,6 +400,7 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
         st.session_state[index_key] = current_idx
 
     current_q = questions[current_idx]
+    qid = current_q["question_id"]
 
     col_title, col_badge = st.columns([3, 1])
     with col_title:
@@ -357,11 +430,15 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
             unsafe_allow_html=True,
         )
 
+    saved_option = answers_cache.get(qid)
+    option_keys = ["A", "B", "C", "D"]
+    default_idx = option_keys.index(saved_option) if saved_option in option_keys else None
+    widget_key = f"option_choice_{attempt_id}_{qid}"
+
     with st.container(border=True):
         st.markdown(f"**{current_q.get('question_text', '')}**")
         st.write("")
 
-        option_keys = ["A", "B", "C", "D"]
         option_labels = {
             "A": f"A. {current_q.get('option_a', '')}",
             "B": f"B. {current_q.get('option_b', '')}",
@@ -369,17 +446,105 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
             "D": f"D. {current_q.get('option_d', '')}",
         }
 
-        widget_key = f"option_choice_{attempt_id}_{current_q['question_id']}"
         st.radio(
             label="Select your answer:",
             options=option_keys,
             format_func=lambda opt: option_labels.get(opt, opt),
-            index=None,
+            index=default_idx,
             key=widget_key,
+            on_change=_on_radio_select,
+            args=(attempt_id, student_id, qid, widget_key, cache_key),
         )
 
-    st.caption("ℹ️ Option selection persistence, question palette, and navigation controls will be enabled in Part 2B-2.")
+    # Navigation Controls Row
+    col_prev, col_clear, col_save_next = st.columns([1, 1, 1])
 
+    with col_prev:
+        st.button(
+            "← Previous",
+            key=f"prev_btn_{attempt_id}_{qid}",
+            disabled=(current_idx == 0),
+            on_click=_on_nav_prev,
+            args=(index_key,),
+            use_container_width=True,
+        )
+
+    with col_clear:
+        st.button(
+            "Clear Selection",
+            key=f"clear_btn_{attempt_id}_{qid}",
+            disabled=(saved_option is None),
+            on_click=_on_clear_selection,
+            args=(attempt_id, student_id, qid, widget_key, cache_key),
+            use_container_width=True,
+        )
+
+    with col_save_next:
+        if current_idx < len(questions) - 1:
+            st.button(
+                "Save & Next →",
+                key=f"save_next_btn_{attempt_id}_{qid}",
+                type="primary",
+                on_click=_on_save_and_next,
+                args=(attempt_id, student_id, qid, widget_key, cache_key, index_key, len(questions) - 1),
+                use_container_width=True,
+            )
+        else:
+            st.button(
+                "Save Answer",
+                key=f"save_btn_{attempt_id}_{qid}",
+                type="primary",
+                on_click=_on_radio_select,
+                args=(attempt_id, student_id, qid, widget_key, cache_key),
+                use_container_width=True,
+            )
+
+    # Question Palette Section
+    st.divider()
+    st.markdown("### Question Palette")
+
+    total_q = len(questions)
+    answered_q = sum(1 for q in questions if answers_cache.get(q["question_id"]) is not None)
+    unanswered_q = total_q - answered_q
+
+    col_tot, col_ans, col_unans = st.columns(3)
+    col_tot.metric("Total Questions", total_q)
+    col_ans.metric("Answered", answered_q)
+    col_unans.metric("Unanswered", unanswered_q)
+
+    st.write("")
+    palette_cols_count = min(total_q, 6)
+    if palette_cols_count > 0:
+        for row_start in range(0, total_q, palette_cols_count):
+            row_slice = questions[row_start:row_start + palette_cols_count]
+            cols = st.columns(palette_cols_count)
+            for offset, q in enumerate(row_slice):
+                q_num = row_start + offset
+                q_id = q["question_id"]
+                is_curr = (q_num == current_idx)
+                is_ans = (answers_cache.get(q_id) is not None)
+
+                if is_curr:
+                    btn_label = f"● {q_num + 1}"
+                    btn_type = "primary"
+                elif is_ans:
+                    btn_label = f"✓ {q_num + 1}"
+                    btn_type = "secondary"
+                else:
+                    btn_label = f"{q_num + 1}"
+                    btn_type = "secondary"
+
+                cols[offset].button(
+                    label=btn_label,
+                    key=f"palette_btn_{attempt_id}_{q_id}",
+                    on_click=_on_palette_jump,
+                    args=(index_key, q_num),
+                    use_container_width=True,
+                    type=btn_type,
+                    help=f"Question {q_num + 1}: {'Current' if is_curr else ('Answered' if is_ans else 'Unanswered')}"
+                )
+
+    st.write("")
     if st.button("Exit to Catalog", key=f"exit_active_{attempt_id}"):
         st.session_state["student_view"] = "catalog"
         st.rerun()
