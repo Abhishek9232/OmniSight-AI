@@ -4,8 +4,10 @@ Provides the Streamlit presentation layer for students to browse published exami
 inspect exam instructions, and initiate assessment attempts.
 """
 
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import streamlit as st
+import streamlit.components.v1 as components
 from src.auth.session import get_current_user, require_role, logout
 from src.exam.service import (
     get_published_exams,
@@ -16,6 +18,7 @@ from src.exam.service import (
     get_attempt_questions,
     get_attempt_answers,
     save_answer,
+    submit_attempt,
 )
 
 
@@ -283,6 +286,152 @@ def _on_palette_jump(index_key: str, target_idx: int) -> None:
     st.session_state[index_key] = target_idx
 
 
+def _render_countdown_timer(
+    official_deadline: datetime,
+    grace_deadline: datetime,
+    remaining_seconds: int,
+    grace_remaining_seconds: int,
+) -> None:
+    """
+    Render an isolated client-side countdown timer component using HTML/JavaScript.
+    Operates smoothly without blocking Python execution or triggering Streamlit reruns.
+    Transitions seamlessly from official exam duration to the 60-second grace window.
+
+    Args:
+        official_deadline: Authoritative server-side expiration timestamp.
+        grace_deadline: Authoritative server-side hard cutoff timestamp (deadline + 60s).
+        remaining_seconds: Current calculated remaining seconds until official deadline.
+        grace_remaining_seconds: Current calculated remaining seconds until hard cutoff.
+    """
+    target_timestamp_ms = int(official_deadline.timestamp() * 1000)
+    grace_timestamp_ms = int(grace_deadline.timestamp() * 1000)
+
+    in_grace = remaining_seconds <= 0
+
+    if in_grace:
+        initial_color = "#D32F2F"
+        initial_bg = "rgba(211, 47, 47, 0.12)"
+        initial_border = "#D32F2F"
+        initial_label = f"⏰ Grace Window: {max(0, grace_remaining_seconds)}s remaining"
+    else:
+        rem_diff = max(0, remaining_seconds)
+        hours = rem_diff // 3600
+        mins = (rem_diff % 3600) // 60
+        secs = rem_diff % 60
+        if hours > 0:
+            formatted_initial = f"{hours:02d}:{mins:02d}:{secs:02d}"
+        else:
+            formatted_initial = f"{mins:02d}:{secs:02d}"
+
+        if rem_diff > 300:
+            initial_color = "#1E88E5"
+            initial_bg = "rgba(30, 136, 229, 0.12)"
+            initial_border = "#1E88E5"
+            initial_label = f"⏳ Time Remaining: {formatted_initial}"
+        elif rem_diff > 60:
+            initial_color = "#FB8C00"
+            initial_bg = "rgba(251, 140, 0, 0.12)"
+            initial_border = "#FB8C00"
+            initial_label = f"⚠️ Time Remaining: {formatted_initial}"
+        else:
+            initial_color = "#E53935"
+            initial_bg = "rgba(229, 57, 53, 0.12)"
+            initial_border = "#E53935"
+            initial_label = f"🚨 Final Minute: {formatted_initial}"
+
+    timer_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            background: transparent;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            overflow: hidden;
+        }}
+        #countdown-display {{
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: {initial_color};
+            background: {initial_bg};
+            border: 1px solid {initial_border};
+        }}
+    </style>
+    </head>
+    <body>
+    <div id="countdown-display">{initial_label}</div>
+    <script>
+        const officialTarget = {target_timestamp_ms};
+        const graceTarget = {grace_timestamp_ms};
+        function tick() {{
+            const now = Date.now();
+            const el = document.getElementById("countdown-display");
+            if (!el) return;
+
+            if (now < officialTarget) {{
+                const diff = Math.max(0, Math.floor((officialTarget - now) / 1000));
+                const hours = Math.floor(diff / 3600);
+                const mins = Math.floor((diff % 3600) / 60);
+                const secs = diff % 60;
+                let formatted = "";
+                if (hours > 0) {{
+                    formatted = String(hours).padStart(2, '0') + ":" + String(mins).padStart(2, '0') + ":" + String(secs).padStart(2, '0');
+                }} else {{
+                    formatted = String(mins).padStart(2, '0') + ":" + String(secs).padStart(2, '0');
+                }}
+
+                if (diff > 300) {{
+                    el.innerText = "⏳ Time Remaining: " + formatted;
+                    el.style.color = "#1E88E5";
+                    el.style.background = "rgba(30, 136, 229, 0.12)";
+                    el.style.borderColor = "#1E88E5";
+                }} else if (diff > 60) {{
+                    el.innerText = "⚠️ Time Remaining: " + formatted;
+                    el.style.color = "#FB8C00";
+                    el.style.background = "rgba(251, 140, 0, 0.12)";
+                    el.style.borderColor = "#FB8C00";
+                }} else {{
+                    el.innerText = "🚨 Final Minute: " + formatted;
+                    el.style.color = "#E53935";
+                    el.style.background = "rgba(229, 57, 53, 0.12)";
+                    el.style.borderColor = "#E53935";
+                }}
+            }} else if (now <= graceTarget) {{
+                const graceDiff = Math.max(0, Math.floor((graceTarget - now) / 1000));
+                el.innerText = "⏰ Grace Window: " + graceDiff + "s remaining";
+                el.style.color = "#D32F2F";
+                el.style.background = "rgba(211, 47, 47, 0.12)";
+                el.style.borderColor = "#D32F2F";
+            }} else {{
+                el.innerText = "⛔ Time Expired! Submitting...";
+                el.style.color = "#D32F2F";
+                el.style.background = "rgba(211, 47, 47, 0.12)";
+                el.style.borderColor = "#D32F2F";
+                clearInterval(timerInterval);
+                setTimeout(function() {{
+                    try {{
+                        window.parent.location.reload();
+                    }} catch(e) {{}}
+                }}, 1000);
+            }}
+        }}
+        tick();
+        const timerInterval = setInterval(tick, 1000);
+    </script>
+    </body>
+    </html>
+    """
+    components.html(timer_html, height=45)
+
+
 def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
     """
     Render the active examination interface displaying the current question, options,
@@ -357,6 +506,35 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
             st.rerun()
         return
 
+    # Authoritative backend server-side timing validation
+    started_at = attempt["started_at"]
+    duration_minutes = exam.get("duration_minutes", 0)
+    official_deadline = started_at + timedelta(minutes=duration_minutes)
+    grace_deadline = official_deadline + timedelta(seconds=60)
+    now = datetime.now()
+
+    # Hard cutoff: only past the 60-second grace window
+    if now > grace_deadline:
+        auto_submit_key = f"auto_submit_handled_{attempt_id}"
+        if not st.session_state.get(auto_submit_key, False):
+            st.session_state[auto_submit_key] = True
+            try:
+                submit_attempt(attempt_id, student_id)
+            except Exception:
+                pass
+        st.session_state["student_flash_msg"] = (
+            "Your examination time has expired. Your attempt has been automatically submitted."
+        )
+        st.session_state["active_attempt_id"] = None
+        st.session_state["view_result_attempt_id"] = attempt_id
+        st.session_state["student_view"] = "catalog"
+        st.rerun()
+        return
+
+    remaining_seconds = int((official_deadline - now).total_seconds())
+    grace_remaining_seconds = max(0, int((grace_deadline - now).total_seconds()))
+    in_grace_window = (now > official_deadline) and (now <= grace_deadline)
+
     try:
         questions = get_attempt_questions(attempt_id, student_id)
     except Exception as e:
@@ -417,18 +595,51 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
 
     st.divider()
 
-    col_qnum, col_marks = st.columns([3, 1])
+    # Visual urgency and grace window alerts
+    if in_grace_window:
+        st.error(
+            f"⏰ Official examination time has concluded. You are in the 60-second grace window "
+            f"({grace_remaining_seconds}s remaining) for in-flight answer saving. "
+            "Your attempt will be automatically submitted when grace concludes."
+        )
+    elif 0 < remaining_seconds <= 60:
+        st.error("🚨 Final Minute! Less than 60 seconds remaining. Your attempt will be automatically submitted when time expires.")
+    elif 0 < remaining_seconds <= 300:
+        st.warning("⚠️ Attention: Less than 5 minutes remaining. Please review your answers.")
+
+    col_qnum, col_marks, col_timer = st.columns([2, 1, 2])
     with col_qnum:
         st.markdown(f"#### Question {current_idx + 1} of {len(questions)}")
     with col_marks:
         marks = current_q.get("marks", 1)
         mark_label = "Mark" if marks == 1 else "Marks"
         st.markdown(
-            f"<div style='text-align: right; font-weight: bold; padding-top: 4px;'>"
+            f"<div style='text-align: center; font-weight: bold; padding-top: 8px;'>"
             f"Points: {marks} {mark_label}"
             f"</div>",
             unsafe_allow_html=True,
         )
+    with col_timer:
+        _render_countdown_timer(
+            official_deadline,
+            grace_deadline,
+            remaining_seconds,
+            grace_remaining_seconds,
+        )
+
+    if in_grace_window:
+        if st.button("Finalize & Submit Exam Now", key=f"grace_submit_{attempt_id}", type="primary", use_container_width=True):
+            try:
+                submit_attempt(attempt_id, student_id)
+            except Exception:
+                pass
+            st.session_state["student_flash_msg"] = (
+                "Examination finalized and submitted successfully."
+            )
+            st.session_state["active_attempt_id"] = None
+            st.session_state["view_result_attempt_id"] = attempt_id
+            st.session_state["student_view"] = "catalog"
+            st.rerun()
 
     saved_option = answers_cache.get(qid)
     option_keys = ["A", "B", "C", "D"]

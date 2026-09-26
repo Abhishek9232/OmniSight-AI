@@ -35,18 +35,18 @@ In an online computer-based examination system, rigorous time enforcement is a f
 
 A fundamental security principle of OmniSight-AI is:
 
-> **The client countdown is a visualization convenience; the server database is the sole authority.**
+> **The client countdown is a visualization convenience; the backend application server clock evaluating against persisted attempt data is the authoritative timing authority.**
 
 ```text
 +----------------------------------------------------------------------------------------------------+
 |                                    SECURITY BOUNDARY PRINCIPLE                                     |
 +----------------------------------------------------------------------------------------------------+
 |                                                                                                    |
-|  CLIENT ENVIRONMENT (Untrusted)                      SERVER ENVIRONMENT (Trusted Authority)        |
+|  CLIENT ENVIRONMENT (Untrusted)                      BACKEND SERVER ENVIRONMENT (Trusted Authority)|
 |                                                                                                    |
-|  - System Clock (Mutable by user)                     - MySQL Server Clock (Authoritative)         |
-|  - Browser DOM (Inspectable/Editable)                 - started_at from exam_attempts              |
-|  - JavaScript Timer (Can be paused/delayed)           - duration_minutes from exams                |
+|  - System Clock (Mutable by user)                     - Backend Server Clock (datetime.now())      |
+|  - Browser DOM (Inspectable/Editable)                 - started_at from exam_attempts (MySQL)      |
+|  - JavaScript Timer (Can be paused/delayed)           - duration_minutes from exams (MySQL)        |
 |                                                       - save_answer() timing validation            |
 |                                                       - submit_attempt() deadline enforcement      |
 |                                                                                                    |
@@ -62,14 +62,14 @@ $$\text{Official Deadline} = \text{started\_at} + (D \times 60 \text{ seconds})$
 
 $$\text{Grace Deadline} = \text{Official Deadline} + 60 \text{ seconds}$$
 
-$$\text{Remaining Time (Server)} = \text{Official Deadline} - \text{NOW}()$$
+$$\text{Remaining Time (Server)} = \text{Official Deadline} - \text{datetime.now}()$$
 
 ### 2.2 The 60-Second Grace Period Policy
 In distributed web environments, real-world constraints such as network jitter, packet retransmissions, cellular latency, and Streamlit execution cycles can cause legitimate submissions initiated at the final second to arrive at the server slightly after the official cutoff.
-- **Allowed within Grace Window** ($0 \ge \text{Remaining Time} \ge -60\text{s}$):
-  In-flight calls to `save_answer()` and `submit_attempt()` are honored.
-- **Hard Cutoff** ($\text{Remaining Time} < -60\text{s}$):
-  Any mutation request to `save_answer()` is unconditionally rejected with `ValueError("Exam duration has expired. Answers can no longer be saved.")`.
+- **Allowed within Grace Window** ($0 \ge \text{Remaining Time} \ge -60\text{s}$, i.e., $\text{Official Deadline} < \text{now} \le \text{Grace Deadline}$):
+  In-flight calls to `save_answer()` and `submit_attempt()` are honored. The UI displays an active grace notice and remaining grace countdown, allowing final answers to persist.
+- **Hard Cutoff** ($\text{now} > \text{Grace Deadline}$):
+  Any mutation request to `save_answer()` is unconditionally rejected with `ValueError("Exam duration has expired. Answers can no longer be saved.")`. The UI automatically finalizes the attempt via `submit_attempt()` and redirects to catalog.
 
 ### 2.3 Prohibition of Client-Side Authority
 - Under no circumstances shall `student_ui.py` accept a client-provided duration or deadline.
@@ -105,12 +105,12 @@ flowchart TD
     Start[render_active_exam Entry] --> FetchAttempt[Load attempt & exam via existing service]
     FetchAttempt --> CheckStatus{attempt.status == 'IN_PROGRESS'?}
     CheckStatus -- No --> RouteResult[Route to Result View]
-    CheckStatus -- Yes --> CalcTime[Compute remaining_seconds against server NOW]
+    CheckStatus -- Yes --> CalcTime[Compute remaining and grace seconds against server datetime.now]
     
     CalcTime --> CheckExpired{now > grace_deadline?}
-    CheckExpired -- Yes (Past Grace) --> AutoSubmit[Call submit_attempt\nSet Flash: Exam Expired\nRoute to Result]
+    CheckExpired -- Yes (Past Grace Cutoff) --> AutoSubmit[Call submit_attempt\nSet Flash: Exam Expired\nRoute to Catalog]
     CheckExpired -- No --> CheckOfficial{now > official_deadline?}
-    CheckOfficial -- Yes (In Grace) --> WarnGrace[Display Grace Warning Banner\nDisable Option Radio Inputs\nTrigger submit_attempt]
+    CheckOfficial -- Yes (In Grace Window) --> RenderGrace[Render Grace Warning Banner\nDisplay Grace Countdown\nAllow In-Flight Answer Saving\nRender Finalize Button]
     CheckOfficial -- No (Active) --> RenderUI[Render Header Timer Badge & Active Exam Interface]
 ```
 
@@ -194,18 +194,18 @@ Streamlit scripts execute linearly on the server from top to bottom. To provide 
 
 ### 5.3 Official Deadline Reached ($T = 0$)
 - Countdown reaches `00:00`.
-- The UI triggers an immediate rerun or auto-submission flow.
-- A warning banner alerts the candidate: *"Examination time has concluded. Saving final answers and submitting..."*
+- The UI seamlessly transitions into the 60-second Grace Window.
+- A prominent alert banner warns the candidate: *"Official examination time has concluded. You are in the 60-second grace window for in-flight answer saving. Submitting automatically when grace concludes."*
 
-### 5.4 Grace Period ($-60\text{s} \le T < 0\text{s}$)
-- Server allows in-flight answer requests to complete.
-- Prevents candidates from starting new answer attempts while guaranteeing that network-delayed clicks are preserved.
-- Automatically triggers `submit_attempt(attempt_id, student_id)`.
+### 5.4 Grace Period ($-60\text{s} \le T \le 0\text{s}$, i.e., $\text{Official Deadline} < \text{now} \le \text{Grace Deadline}$)
+- Server allows in-flight answer requests to complete; `save_answer()` succeeds.
+- Timer badge displays remaining grace seconds in Crimson (`#D32F2F`): `⏰ Grace Window: Xs remaining`.
+- Candidate can click "Finalize & Submit Exam Now" to finalize immediately, or allow automatic submission upon grace expiry.
 
-### 5.5 Hard Cutoff ($T < -60\text{s}$)
+### 5.5 Hard Cutoff ($\text{now} > \text{Grace Deadline}$, i.e., $T < -60\text{s}$)
+- Server-side hard cutoff is enforced.
 - If `save_answer()` is called, the service layer throws `ValueError("Exam duration has expired. Answers can no longer be saved.")`.
-- UI catches the error and displays a clear message.
-- Any attempt in `IN_PROGRESS` status is immediately transitioned to `SUBMITTED`.
+- `render_active_exam()` automatically invokes `submit_attempt(attempt_id, student_id)`, transitions attempt to `SUBMITTED`, sets flash message, and redirects to catalog.
 
 ### 5.6 Page Rerun & Widget Interaction Behavior
 - Streamlit reruns upon every button click or radio change.
