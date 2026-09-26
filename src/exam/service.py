@@ -1469,3 +1469,86 @@ def get_attempt_result(attempt_id: int, student_id: int) -> Dict[str, Any]:
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+
+
+def get_published_exams() -> List[Dict[str, Any]]:
+    """
+    Retrieve all examinations currently in PUBLISHED status, including total question count.
+
+    Returns:
+        List of dicts representing published exams, ordered by created_at DESC.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT e.exam_id, e.title, e.description, e.duration_minutes, e.created_by, e.status, e.created_at,
+                   COUNT(q.question_id) AS question_count
+            FROM exams e
+            LEFT JOIN questions q ON e.exam_id = q.exam_id
+            WHERE e.status = 'PUBLISHED'
+            GROUP BY e.exam_id, e.title, e.description, e.duration_minutes, e.created_by, e.status, e.created_at
+            ORDER BY e.created_at DESC;
+        """
+        cursor.execute(query)
+        exams = cursor.fetchall()
+        for exam in exams:
+            exam["question_count"] = int(exam["question_count"])
+        return exams
+    except mysql.connector.Error:
+        return []
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def get_student_attempt_for_exam(exam_id: int, student_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve an existing attempt for a specific examination and student if one exists.
+
+    Args:
+        exam_id: Unique exam identifier.
+        student_id: User ID of the student.
+
+    Returns:
+        Dict representing attempt record if found, None otherwise.
+
+    Raises:
+        ValueError: If parameters are invalid or student does not exist.
+        PermissionError: If user does not have student role.
+    """
+    if not isinstance(exam_id, int) or exam_id <= 0:
+        raise ValueError("Valid exam ID is required.")
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access student attempt details.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status
+            FROM exam_attempts
+            WHERE exam_id = %s AND student_id = %s
+            LIMIT 1;
+        """
+        cursor.execute(query, (exam_id, student_id))
+        return cursor.fetchone()
+    except mysql.connector.Error:
+        return None
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
