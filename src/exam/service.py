@@ -1530,6 +1530,208 @@ def get_attempt_result(attempt_id: int, student_id: int) -> Dict[str, Any]:
             conn.close()
 
 
+def get_attempt_scorecard_details(attempt_id: int, student_id: int) -> Dict[str, Any]:
+    """
+    Retrieve comprehensive examination result and question breakdown details for an
+    authenticated student's evaluated attempt.
+
+    Uses the exam's complete question set as the base and performs a LEFT JOIN on answers
+    to ensure unvisited/unanswered questions are accurately represented. Strictly excludes
+    the teacher's authoritative correct_option / answer key.
+
+    Args:
+        attempt_id: Unique attempt identifier.
+        student_id: User ID of the requesting student.
+
+    Returns:
+        Dict containing attempt metadata, aggregate score metrics, answer category counts,
+        and question-by-question breakdown list:
+        - attempt_id (int)
+        - exam_id (int)
+        - exam_title (str)
+        - duration_minutes (int)
+        - started_at (datetime)
+        - submitted_at (Optional[datetime])
+        - time_taken_seconds (int)
+        - evaluated_at (datetime)
+        - status (str)
+        - total_marks (float)
+        - obtained_marks (float)
+        - percentage (float)
+        - total_questions (int)
+        - correct_count (int)
+        - incorrect_count (int)
+        - unanswered_count (int)
+        - questions_breakdown (List[Dict[str, Any]]):
+            - question_id (int)
+            - question_text (str)
+            - option_a (str)
+            - option_b (str)
+            - option_c (str)
+            - option_d (str)
+            - marks (float)
+            - selected_option (Optional[str])
+            - is_correct (Optional[bool])
+            - status (str: "CORRECT", "INCORRECT", "UNANSWERED")
+            - marks_awarded (float)
+
+    Raises:
+        ValueError: If parameters are invalid, student not found, attempt not found,
+                    attempt is not in EVALUATED status, or result record is missing.
+        PermissionError: If user is not student or attempt belongs to another student.
+    """
+    if not isinstance(attempt_id, int) or attempt_id <= 0:
+        raise ValueError("Valid attempt ID is required.")
+
+    if not isinstance(student_id, int) or student_id <= 0:
+        raise ValueError("Valid student ID is required.")
+
+    # 1. Verify student exists & has role 'student'
+    user_role = _get_user_role(student_id)
+    if not user_role:
+        raise ValueError("Student user does not exist.")
+
+    if user_role.lower() != "student":
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access student examination scorecards.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 2. Fetch attempt by attempt_id
+        cursor.execute(
+            "SELECT attempt_id, exam_id, student_id, started_at, submitted_at, status FROM exam_attempts WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        attempt = cursor.fetchone()
+        if not attempt:
+            raise ValueError(f"Exam attempt with ID {attempt_id} not found.")
+
+        # 3. Verify attempt belongs to the requesting student
+        if attempt["student_id"] != student_id:
+            raise PermissionError("Unauthorized: You do not have permission to access scorecard details for this examination attempt.")
+
+        # 4. Verify attempt is in EVALUATED status
+        if attempt["status"] != "EVALUATED":
+            raise ValueError(
+                f"Cannot retrieve scorecard: Attempt status is '{attempt['status']}'. "
+                f"Only EVALUATED attempts have a finalized scorecard."
+            )
+
+        # 5. Fetch result row from results table
+        cursor.execute(
+            "SELECT result_id, attempt_id, total_marks, obtained_marks, percentage, evaluated_at FROM results WHERE attempt_id = %s LIMIT 1;",
+            (attempt_id,)
+        )
+        result = cursor.fetchone()
+        if not result:
+            raise ValueError(f"No result record found for evaluated attempt ID {attempt_id}.")
+
+        # 6. Fetch associated exam metadata
+        cursor.execute(
+            "SELECT title, duration_minutes FROM exams WHERE exam_id = %s LIMIT 1;",
+            (attempt["exam_id"],)
+        )
+        exam = cursor.fetchone()
+        if not exam:
+            raise ValueError(f"Associated exam with ID {attempt['exam_id']} not found.")
+
+        # 7. Calculate elapsed test time
+        time_taken_seconds = 0
+        if attempt.get("submitted_at") and attempt.get("started_at"):
+            time_taken_seconds = max(0, int((attempt["submitted_at"] - attempt["started_at"]).total_seconds()))
+
+        # 8. Query complete question set with LEFT JOIN on answers
+        # Authoritative correct_option is strictly excluded to prevent answer key leakage.
+        cursor.execute(
+            """
+            SELECT
+                q.question_id, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d, q.marks,
+                a.answer_id, a.selected_option, a.is_correct
+            FROM questions q
+            LEFT JOIN answers a ON q.question_id = a.question_id AND a.attempt_id = %s
+            WHERE q.exam_id = %s
+            ORDER BY q.question_id ASC;
+            """,
+            (attempt_id, attempt["exam_id"])
+        )
+        question_rows = cursor.fetchall()
+
+        # 9. Categorize question results and compute category counts
+        correct_count = 0
+        incorrect_count = 0
+        unanswered_count = 0
+        questions_breakdown = []
+
+        for row in question_rows:
+            q_marks = float(row["marks"])
+            raw_selected = row.get("selected_option")
+            raw_is_correct = row.get("is_correct")
+            is_correct_bool = bool(raw_is_correct) if raw_is_correct is not None else None
+
+            # Classification:
+            # 1. Answer row exists + is_correct = TRUE -> CORRECT (+marks)
+            # 2. Answer row exists + is_correct = FALSE -> INCORRECT (0 marks)
+            # 3. No answer row exists (or selected_option is None) -> UNANSWERED (0 marks)
+            if raw_selected is not None and is_correct_bool is True:
+                status = "CORRECT"
+                marks_awarded = q_marks
+                correct_count += 1
+                selected_option = raw_selected
+            elif raw_selected is not None and is_correct_bool is False:
+                status = "INCORRECT"
+                marks_awarded = 0.0
+                incorrect_count += 1
+                selected_option = raw_selected
+            else:
+                status = "UNANSWERED"
+                marks_awarded = 0.0
+                unanswered_count += 1
+                selected_option = None
+                is_correct_bool = None
+
+            questions_breakdown.append({
+                "question_id": row["question_id"],
+                "question_text": row["question_text"],
+                "option_a": row["option_a"],
+                "option_b": row["option_b"],
+                "option_c": row["option_c"],
+                "option_d": row["option_d"],
+                "marks": q_marks,
+                "selected_option": selected_option,
+                "is_correct": is_correct_bool,
+                "status": status,
+                "marks_awarded": marks_awarded,
+            })
+
+        return {
+            "attempt_id": attempt["attempt_id"],
+            "exam_id": attempt["exam_id"],
+            "exam_title": exam["title"],
+            "duration_minutes": exam["duration_minutes"],
+            "started_at": attempt["started_at"],
+            "submitted_at": attempt["submitted_at"],
+            "time_taken_seconds": time_taken_seconds,
+            "evaluated_at": result["evaluated_at"],
+            "status": attempt["status"],
+            "total_marks": float(result["total_marks"]),
+            "obtained_marks": float(result["obtained_marks"]),
+            "percentage": float(result["percentage"]) if result["percentage"] is not None else 0.0,
+            "total_questions": len(questions_breakdown),
+            "correct_count": correct_count,
+            "incorrect_count": incorrect_count,
+            "unanswered_count": unanswered_count,
+            "questions_breakdown": questions_breakdown,
+        }
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+
 def get_published_exams() -> List[Dict[str, Any]]:
     """
     Retrieve all examinations currently in PUBLISHED status, including total question count.
