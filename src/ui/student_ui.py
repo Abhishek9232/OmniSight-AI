@@ -21,6 +21,7 @@ from src.exam.service import (
     submit_attempt,
     evaluate_attempt,
     get_attempt_result,
+    get_attempt_scorecard_details,
 )
 
 
@@ -541,14 +542,15 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
             st.session_state[auto_submit_key] = True
             try:
                 submit_attempt(attempt_id, student_id)
+                evaluate_attempt(attempt_id, student_id)
             except Exception:
                 pass
         st.session_state["student_flash_msg"] = (
-            "Your examination time has expired. Your attempt has been automatically submitted."
+            "Your examination time has expired. Your attempt has been automatically submitted and evaluated."
         )
         st.session_state["active_attempt_id"] = None
         st.session_state["view_result_attempt_id"] = attempt_id
-        st.session_state["student_view"] = "catalog"
+        st.session_state["student_view"] = "result"
         st.rerun()
         return
 
@@ -652,14 +654,15 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
         if st.button("Finalize & Submit Exam Now", key=f"grace_submit_{attempt_id}", type="primary", use_container_width=True):
             try:
                 submit_attempt(attempt_id, student_id)
+                evaluate_attempt(attempt_id, student_id)
             except Exception:
                 pass
             st.session_state["student_flash_msg"] = (
-                "Examination finalized and submitted successfully."
+                "Examination finalized, submitted, and evaluated successfully."
             )
             st.session_state["active_attempt_id"] = None
             st.session_state["view_result_attempt_id"] = attempt_id
-            st.session_state["student_view"] = "catalog"
+            st.session_state["student_view"] = "result"
             st.rerun()
 
     saved_option = answers_cache.get(qid)
@@ -1104,6 +1107,216 @@ def render_exam_review(student_id: int, attempt_id: Optional[int]) -> None:
             st.rerun()
 
 
+def render_result_view(student_id: int, attempt_id: Optional[int]) -> None:
+    """
+    Render the comprehensive examination result scorecard interface for an evaluated attempt.
+    Displays exam metadata, overall marks, percentage, aggregate answer counts,
+    and question-by-question breakdown while strictly keeping the authoritative
+    answer key concealed.
+
+    Args:
+        student_id: User ID of the authenticated student.
+        attempt_id: Unique attempt identifier from session state.
+    """
+    if not attempt_id:
+        st.warning("No examination attempt selected for result display.")
+        if st.button("Return to Catalog", key="no_result_attempt_btn", type="primary"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["view_result_attempt_id"] = None
+            st.rerun()
+        return
+
+    # Retrieve scorecard details directly (read-only query)
+    scorecard = None
+    try:
+        scorecard = get_attempt_scorecard_details(attempt_id, student_id)
+    except ValueError as e:
+        st.error(f"Examination scorecard is currently unavailable: {str(e)}")
+        if st.button("Return to Catalog", key="scorecard_val_err_btn", type="primary"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["view_result_attempt_id"] = None
+            st.rerun()
+        return
+    except PermissionError as e:
+        st.error(f"Access Denied: {str(e)}")
+        if st.button("Return to Catalog", key="scorecard_perm_err_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["view_result_attempt_id"] = None
+            st.rerun()
+        return
+    except Exception as e:
+        st.error(f"Unexpected error loading examination scorecard: {str(e)}")
+        if st.button("Return to Catalog", key="scorecard_gen_err_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["view_result_attempt_id"] = None
+            st.rerun()
+        return
+
+    if not scorecard:
+        st.error("Examination scorecard could not be retrieved.")
+        if st.button("Return to Catalog", key="scorecard_empty_btn"):
+            st.session_state["student_view"] = "catalog"
+            st.session_state["view_result_attempt_id"] = None
+            st.rerun()
+        return
+
+    # 1. Header & Title Block
+    col_title, col_status = st.columns([3, 1])
+    with col_title:
+        st.subheader("Examination Scorecard")
+        st.markdown(f"### {scorecard['exam_title']}")
+    with col_status:
+        st.markdown(
+            f"<div style='text-align: right; padding-top: 10px; font-weight: bold; color: #2E7D32;'>"
+            f"STATUS: {scorecard['status']}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    st.success(
+        f"Attempt #{scorecard['attempt_id']} has been evaluated!\n\n"
+        f"**Score:** {scorecard['obtained_marks']} / {scorecard['total_marks']} ({scorecard['percentage']}%)"
+    )
+
+    # 2. Metadata Information Container
+    time_taken_sec = scorecard.get("time_taken_seconds", 0)
+    minutes = time_taken_sec // 60
+    seconds = time_taken_sec % 60
+    time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+    started_str = scorecard["started_at"].strftime("%Y-%m-%d %H:%M:%S") if scorecard.get("started_at") else "N/A"
+    submitted_str = scorecard["submitted_at"].strftime("%Y-%m-%d %H:%M:%S") if scorecard.get("submitted_at") else "N/A"
+    evaluated_str = scorecard["evaluated_at"].strftime("%Y-%m-%d %H:%M:%S") if scorecard.get("evaluated_at") else "N/A"
+
+    with st.container(border=True):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.caption(f"**Attempt ID**: #{scorecard['attempt_id']}")
+        m1.caption(f"**Exam Duration**: {scorecard['duration_minutes']} mins")
+        m2.caption(f"**Started**: {started_str}")
+        m2.caption(f"**Submitted**: {submitted_str}")
+        m3.caption(f"**Time Taken**: {time_str}")
+        m3.caption(f"**Evaluated**: {evaluated_str}")
+        m4.caption(f"**Total Questions**: {scorecard['total_questions']}")
+        m4.caption(f"**Evaluation**: Automated")
+
+    # 3. Overall Result Metric Cards
+    total_m = scorecard["total_marks"]
+    obtained_m = scorecard["obtained_marks"]
+    percentage = scorecard["percentage"]
+    answered_count = scorecard["correct_count"] + scorecard["incorrect_count"]
+    total_q = scorecard["total_questions"]
+
+    st.markdown("#### Performance Overview")
+    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1.metric("Obtained Score", f"{obtained_m:.1f} / {total_m:.1f}")
+    kpi2.metric("Percentage", f"{percentage:.2f}%")
+    kpi3.metric("Completion Rate", f"{answered_count} / {total_q}")
+
+    # 4. Performance Summary Badges / Answer Counters
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            f"<div style='background-color: #E8F5E9; border-left: 5px solid #2E7D32; padding: 12px; border-radius: 4px;'>"
+            f"<div style='font-size: 13px; color: #1B5E20; font-weight: bold;'>✓ Correct Answers</div>"
+            f"<div style='font-size: 22px; font-weight: bold; color: #2E7D32;'>{scorecard['correct_count']}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    with c2:
+        st.markdown(
+            f"<div style='background-color: #FFEBEE; border-left: 5px solid #D32F2F; padding: 12px; border-radius: 4px;'>"
+            f"<div style='font-size: 13px; color: #B71C1C; font-weight: bold;'>✗ Incorrect Answers</div>"
+            f"<div style='font-size: 22px; font-weight: bold; color: #D32F2F;'>{scorecard['incorrect_count']}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    with c3:
+        st.markdown(
+            f"<div style='background-color: #FFF3E0; border-left: 5px solid #ED6C02; padding: 12px; border-radius: 4px;'>"
+            f"<div style='font-size: 13px; color: #E65100; font-weight: bold;'>⚠️ Unanswered Questions</div>"
+            f"<div style='font-size: 22px; font-weight: bold; color: #ED6C02;'>{scorecard['unanswered_count']}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    st.divider()
+
+    # 5. Question-Wise Breakdown
+    st.markdown("#### Question-Wise Breakdown")
+    st.caption("Review your responses and awarded marks. Authoritative answer keys are concealed to protect examination integrity.")
+
+    questions = scorecard.get("questions_breakdown", [])
+    for idx, q in enumerate(questions):
+        status = q.get("status", "UNANSWERED")
+        q_marks = q.get("marks", 1.0)
+        awarded = q.get("marks_awarded", 0.0)
+        selected = q.get("selected_option")
+
+        if status == "CORRECT":
+            status_color = "#2E7D32"
+            status_bg = "#E8F5E9"
+            badge_icon = "✓"
+            badge_label = "Correct"
+        elif status == "INCORRECT":
+            status_color = "#D32F2F"
+            status_bg = "#FFEBEE"
+            badge_icon = "✗"
+            badge_label = "Incorrect"
+        else:
+            status_color = "#ED6C02"
+            status_bg = "#FFF3E0"
+            badge_icon = "⚠️"
+            badge_label = "Unanswered"
+
+        with st.container(border=True):
+            col_qhead, col_qscore = st.columns([3, 1])
+            with col_qhead:
+                st.markdown(
+                    f"**Question {idx + 1}** &nbsp; "
+                    f"<span style='background-color: {status_bg}; color: {status_color}; font-weight: bold; padding: 3px 8px; border-radius: 4px; font-size: 12px;'>"
+                    f"{badge_icon} {badge_label}"
+                    f"</span>",
+                    unsafe_allow_html=True
+                )
+            with col_qscore:
+                st.markdown(
+                    f"<div style='text-align: right; font-weight: bold; color: {status_color};'>"
+                    f"{awarded:.1f} / {q_marks:.1f} Marks"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            st.markdown(f"**{q.get('question_text', '')}**")
+
+            # Selected option display
+            if selected:
+                opt_key = f"option_{selected.lower()}"
+                opt_content = q.get(opt_key, "")
+                st.markdown(
+                    f"**Your Answer:** &nbsp; "
+                    f"<span style='color: {status_color}; font-weight: bold;'>"
+                    f"Option {selected}: {opt_content}"
+                    f"</span>",
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    "**Your Answer:** &nbsp; "
+                    "<span style='color: #ED6C02; font-style: italic;'>"
+                    "None (Question Skipped)"
+                    "</span>",
+                    unsafe_allow_html=True
+                )
+
+    st.divider()
+
+    # 6. Navigation Control: Return to Catalog
+    if st.button("← Return to Examination Catalog", key="return_to_catalog_from_scorecard", type="primary", use_container_width=True):
+        st.session_state["student_view"] = "catalog"
+        st.session_state["view_result_attempt_id"] = None
+        st.rerun()
+
+
 def render_student_ui() -> None:
     """
     Main entrypoint for the Student Exam Portal presentation layer.
@@ -1145,25 +1358,7 @@ def render_student_ui() -> None:
 
     elif view == "result":
         attempt_id = st.session_state.get("view_result_attempt_id")
-        st.subheader("Examination Result")
-        if attempt_id:
-            try:
-                res = get_attempt_result(attempt_id, user["id"])
-                st.success(
-                    f"Attempt #{attempt_id} has been evaluated!\n\n"
-                    f"**Score:** {res['obtained_marks']} / {res['total_marks']} ({res['percentage']}%)"
-                )
-            except Exception:
-                st.info(
-                    f"Viewing results for attempt ID: {attempt_id}.\n\n"
-                    "The comprehensive result scorecard interface will be implemented in Step 3 Part 2C."
-                )
-        else:
-            st.info("No active result selected.")
-        if st.button("Return to Catalog", key="return_from_result"):
-            st.session_state["student_view"] = "catalog"
-            st.session_state["view_result_attempt_id"] = None
-            st.rerun()
+        render_result_view(user["id"], attempt_id)
 
     else:
         st.session_state["student_view"] = "catalog"

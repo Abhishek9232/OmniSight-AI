@@ -112,15 +112,22 @@ stateDiagram-v2
 | **`SUBMITTED`** | `submit_attempt()` | `exam_attempts` (`status = 'SUBMITTED'`, `submitted_at = NOW()`) | Student can view review summary; all answer mutations blocked. | `EVALUATED` |
 | **`EVALUATED`** | `evaluate_attempt()` | `answers` (`is_correct`), `results` (INSERT 1 row), `exam_attempts` (`status = 'EVALUATED'`) | Student can read full scorecard; teacher can read exam results. | None (Terminal State) |
 
-### 2.2 Evaluation Triggering Strategies
-Two complementary triggers ensure an attempt is evaluated without friction:
-1. **Immediate Post-Submission Chaining**:
-   - In `render_exam_review()`, immediately following successful execution of `submit_attempt(attempt_id, student_id)`, the client synchronously invokes `evaluate_attempt(attempt_id, student_id)`.
-   - On success, `st.session_state["student_view"] = "result"` displays the finalized scorecard immediately.
-2. **On-Demand Fallback in Result View**:
-   - If an attempt reached `SUBMITTED` via background deadline timeout or if a network disconnect interrupted post-submission chaining, the attempt remains in `SUBMITTED` status.
-   - When `render_result_view()` executes, it checks `attempt["status"]`. If status is `'SUBMITTED'`, it automatically executes `evaluate_attempt(attempt_id, student_id)` before rendering the scorecard.
-   - This guarantees that students are never permanently trapped in an un-evaluated limbo state.
+### 2.2 Evaluation Triggering Architecture
+
+In accordance with strict Command-Query Separation (CQS) and clean architectural boundaries, evaluation execution is coupled strictly to submission action boundaries rather than presentation components:
+
+1. **Submission Action Boundary Chaining**:
+   - **Manual Submission**: In `render_exam_review()`, when the examinee confirms submission, the action handler synchronously chains:
+     $$\text{submit\_attempt}(attempt\_id, student\_id) \longrightarrow \text{evaluate\_attempt}(attempt\_id, student\_id)$$
+     transitioning the attempt deterministically from `IN_PROGRESS` $\to$ `SUBMITTED` $\to$ `EVALUATED`. Upon completion, the UI sets `student_view = "result"` to display the scorecard.
+   - **Timer Expiration Cutoff**: In both active examination (`render_active_exam()`) and review (`render_exam_review()`), when server-side timing validation identifies that the grace window has concluded, the expiration handler executes the same atomic submission sequence:
+     $$\text{submit\_attempt}(attempt\_id, student\_id) \longrightarrow \text{evaluate\_attempt}(attempt\_id, student\_id)$$
+     locking the attempt, evaluating answers, and transitioning to `EVALUATED` at the action boundary.
+2. **Strictly Read-Only Result Presentation (`render_result_view`)**:
+   - `render_result_view()` is a pure, idempotent presentation component. It never calls `evaluate_attempt()`, `submit_attempt()`, or performs any database write operations.
+   - It retrieves finalized scorecard data exclusively through the service query:
+     $$\text{get\_attempt\_scorecard\_details}(attempt\_id, student\_id)$$
+   - If invoked with an attempt not in `EVALUATED` status (or if scorecard retrieval raises `ValueError`), `render_result_view()` renders an informative notice indicating that evaluation is pending or unavailable, provides a direct return path to the Exam Catalog, and never mutates attempt state.
 
 ---
 
