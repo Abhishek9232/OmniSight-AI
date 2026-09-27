@@ -1813,3 +1813,197 @@ def get_student_attempt_for_exam(exam_id: int, student_id: int) -> Optional[Dict
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+
+
+def get_exam_results(exam_id: int, teacher_id: int) -> Dict[str, Any]:
+    """
+    Retrieve comprehensive evaluation results, performance analytics, and student
+    submission roster for an examination owned by the authenticated teacher or admin.
+
+    Args:
+        exam_id: Unique exam identifier.
+        teacher_id: User ID of the requesting teacher or admin.
+
+    Returns:
+        Dict containing exam metadata, summary analytics, and list of student results:
+        - exam_id (int)
+        - exam_title (str)
+        - duration_minutes (int)
+        - status (str)
+        - total_questions (int)
+        - total_exam_marks (float)
+        - summary (Dict[str, Any]):
+            - total_attempts (int)
+            - evaluated_count (int)
+            - in_progress_count (int)
+            - average_score (float)
+            - average_percentage (float)
+            - highest_score (float)
+            - lowest_score (float)
+        - results (List[Dict[str, Any]]):
+            - attempt_id (int)
+            - student_id (int)
+            - student_name (str)
+            - student_email (str)
+            - started_at (datetime)
+            - submitted_at (Optional[datetime])
+            - evaluated_at (Optional[datetime])
+            - status (str)
+            - total_marks (Optional[float])
+            - obtained_marks (Optional[float])
+            - percentage (Optional[float])
+            - time_taken_seconds (Optional[int])
+
+    Raises:
+        ValueError: If exam_id or teacher_id are invalid, or exam is not found.
+        PermissionError: If user is not teacher/admin, or exam is not owned by teacher.
+    """
+    if not isinstance(exam_id, int) or exam_id <= 0:
+        raise ValueError("Valid exam ID is required.")
+    if not isinstance(teacher_id, int) or teacher_id <= 0:
+        raise ValueError("Valid teacher ID is required.")
+
+    # 1. Validate caller role: teacher and admin allowed, student rejected
+    user_role = _get_user_role(teacher_id)
+    if not user_role:
+        raise ValueError("Teacher user does not exist.")
+    if user_role.lower() not in {"teacher", "admin"}:
+        raise PermissionError(f"Unauthorized: Users with role '{user_role}' cannot access teacher exam results.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 2. Fetch exam and verify existence
+        cursor.execute(
+            "SELECT exam_id, title, duration_minutes, created_by, status, created_at FROM exams WHERE exam_id = %s LIMIT 1;",
+            (exam_id,)
+        )
+        exam = cursor.fetchone()
+        if not exam:
+            raise ValueError(f"Exam with ID {exam_id} not found.")
+
+        # 3. Ownership verification: teacher can access only their own exams, admin can access any
+        if user_role.lower() != "admin" and exam["created_by"] != teacher_id:
+            raise PermissionError("Unauthorized: You do not have permission to view results for this examination.")
+
+        # 4. Fetch total questions and total marks for the exam
+        cursor.execute(
+            "SELECT COUNT(*) AS total_questions, COALESCE(SUM(marks), 0) AS total_exam_marks FROM questions WHERE exam_id = %s;",
+            (exam_id,)
+        )
+        q_info = cursor.fetchone()
+        total_questions = int(q_info["total_questions"]) if q_info else 0
+        total_exam_marks = float(q_info["total_exam_marks"]) if q_info else 0.0
+
+        # 5. Fetch student attempts and associated results
+        query = """
+            SELECT
+                ea.attempt_id,
+                ea.exam_id,
+                ea.student_id,
+                u.name AS student_name,
+                u.email AS student_email,
+                ea.started_at,
+                ea.submitted_at,
+                ea.status AS attempt_status,
+                r.result_id,
+                r.total_marks,
+                r.obtained_marks,
+                r.percentage,
+                r.evaluated_at
+            FROM exam_attempts ea
+            JOIN users u ON ea.student_id = u.id
+            LEFT JOIN results r ON ea.attempt_id = r.attempt_id
+            WHERE ea.exam_id = %s
+            ORDER BY ea.submitted_at DESC, ea.started_at DESC;
+        """
+        cursor.execute(query, (exam_id,))
+        rows = cursor.fetchall()
+
+        results_list = []
+        total_attempts = len(rows)
+        evaluated_count = 0
+        in_progress_count = 0
+        evaluated_scores = []
+        evaluated_percentages = []
+
+        for row in rows:
+            st_status = row["attempt_status"]
+            if st_status == "EVALUATED":
+                evaluated_count += 1
+                obt_m = float(row["obtained_marks"]) if row["obtained_marks"] is not None else 0.0
+                tot_m = float(row["total_marks"]) if row["total_marks"] is not None else 0.0
+                pct = float(row["percentage"]) if row["percentage"] is not None else 0.0
+                evaluated_scores.append(obt_m)
+                evaluated_percentages.append(pct)
+                time_taken = int((row["submitted_at"] - row["started_at"]).total_seconds()) if row["submitted_at"] and row["started_at"] else None
+                eval_at = row["evaluated_at"]
+                sub_at = row["submitted_at"]
+            elif st_status == "IN_PROGRESS":
+                in_progress_count += 1
+                obt_m = None
+                tot_m = None
+                pct = None
+                time_taken = None
+                eval_at = None
+                sub_at = None
+            else:  # SUBMITTED or other
+                obt_m = float(row["obtained_marks"]) if row["obtained_marks"] is not None else None
+                tot_m = float(row["total_marks"]) if row["total_marks"] is not None else None
+                pct = float(row["percentage"]) if row["percentage"] is not None else None
+                time_taken = int((row["submitted_at"] - row["started_at"]).total_seconds()) if row["submitted_at"] and row["started_at"] else None
+                eval_at = row["evaluated_at"]
+                sub_at = row["submitted_at"]
+
+            results_list.append({
+                "attempt_id": row["attempt_id"],
+                "student_id": row["student_id"],
+                "student_name": row["student_name"],
+                "student_email": row["student_email"],
+                "started_at": row["started_at"],
+                "submitted_at": sub_at,
+                "evaluated_at": eval_at,
+                "status": st_status,
+                "total_marks": tot_m,
+                "obtained_marks": obt_m,
+                "percentage": pct,
+                "time_taken_seconds": time_taken,
+            })
+
+        if evaluated_scores:
+            average_score = round(sum(evaluated_scores) / len(evaluated_scores), 2)
+            average_percentage = round(sum(evaluated_percentages) / len(evaluated_percentages), 2)
+            highest_score = round(max(evaluated_scores), 2)
+            lowest_score = round(min(evaluated_scores), 2)
+        else:
+            average_score = 0.0
+            average_percentage = 0.0
+            highest_score = 0.0
+            lowest_score = 0.0
+
+        return {
+            "exam_id": exam["exam_id"],
+            "exam_title": exam["title"],
+            "duration_minutes": exam["duration_minutes"],
+            "status": exam["status"],
+            "total_questions": total_questions,
+            "total_exam_marks": total_exam_marks,
+            "summary": {
+                "total_attempts": total_attempts,
+                "evaluated_count": evaluated_count,
+                "in_progress_count": in_progress_count,
+                "average_score": average_score,
+                "average_percentage": average_percentage,
+                "highest_score": highest_score,
+                "lowest_score": lowest_score,
+            },
+            "results": results_list,
+        }
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()

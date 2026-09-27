@@ -15,6 +15,7 @@ from src.exam.service import (
     delete_question,
     publish_exam,
     close_exam,
+    get_exam_results,
 )
 
 
@@ -701,21 +702,210 @@ def render_lifecycle_section(teacher_id: int) -> None:
             st.write(f"Unknown status: {status}")
 
 
+def render_exam_results_section(teacher_id: int) -> None:
+    """
+    Render the examination results, performance metrics, and examinee submission roster.
+    Allows teachers to select an assessment, view high-level performance analytics,
+    filter and sort students, and inspect individual submission records.
+
+    Args:
+        teacher_id: User ID of the authenticated teacher/admin.
+    """
+    st.markdown("### Examination Results & Analytics")
+    st.caption("Inspect student submissions, aggregate score distributions, and individual evaluation scorecards.")
+
+    try:
+        exams: List[Dict[str, Any]] = get_teacher_exams(teacher_id)
+    except Exception as e:
+        st.error(f"Failed to load examinations: {str(e)}")
+        return
+
+    if not exams:
+        st.info("No examinations available. Author and publish an examination first to collect student submissions.")
+        return
+
+    # 1. Exam Selector
+    exam_options = {
+        exam["exam_id"]: f"{exam.get('title', 'Untitled Exam')} (ID: {exam['exam_id']}, Status: {exam.get('status', 'DRAFT')})"
+        for exam in exams
+    }
+    exam_ids = list(exam_options.keys())
+
+    selected_exam_id = st.selectbox(
+        "Select Examination",
+        options=exam_ids,
+        format_func=lambda eid: exam_options[eid],
+        key="teacher_results_selected_exam_id",
+        help="Choose an examination to view examinee submissions and score analytics.",
+    )
+
+    if not selected_exam_id:
+        return
+
+    try:
+        data = get_exam_results(selected_exam_id, teacher_id)
+    except ValueError as e:
+        st.error(f"Validation Error: {str(e)}")
+        return
+    except PermissionError as e:
+        st.error(f"Permission Denied: {str(e)}")
+        return
+    except Exception as e:
+        st.error(f"Failed to retrieve examination results: {str(e)}")
+        return
+
+    summary = data.get("summary", {})
+    results = data.get("results", [])
+    total_exam_marks = data.get("total_exam_marks", 0.0)
+
+    # 2. Exam Context Subheader
+    st.caption(
+        f"**Exam Title:** {data.get('exam_title')} | "
+        f"**Duration:** {data.get('duration_minutes')} mins | "
+        f"**Questions:** {data.get('total_questions')} | "
+        f"**Total Marks:** {total_exam_marks:.1f} | "
+        f"**Status:** {data.get('status')}"
+    )
+
+    # 3. KPI Cards
+    col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+    with col_kpi1:
+        st.metric("Total Attempts", summary.get("total_attempts", 0))
+    with col_kpi2:
+        st.metric("Evaluated", summary.get("evaluated_count", 0))
+    with col_kpi3:
+        st.metric("In Progress", summary.get("in_progress_count", 0))
+    with col_kpi4:
+        if summary.get("evaluated_count", 0) > 0:
+            avg_score = summary.get("average_score", 0.0)
+            avg_pct = summary.get("average_percentage", 0.0)
+            st.metric("Class Average", f"{avg_score:.1f} / {total_exam_marks:.1f} ({avg_pct:.1f}%)")
+        else:
+            st.metric("Class Average", "N/A (0 evaluated)")
+
+    if summary.get("evaluated_count", 0) > 0:
+        st.caption(
+            f"**Score Extremes:** Highest: **{summary.get('highest_score', 0.0):.1f}** Marks | "
+            f"Lowest: **{summary.get('lowest_score', 0.0):.1f}** Marks"
+        )
+
+    st.divider()
+
+    # 4. Empty State Handling
+    if not results:
+        st.info("No student attempts have been recorded for this examination yet.")
+        return
+
+    # 5. Search & Sort Controls
+    col_search, col_sort = st.columns([2, 2])
+    with col_search:
+        search_query = st.text_input(
+            "Search Students",
+            placeholder="Filter by student name or email...",
+            key=f"search_res_{selected_exam_id}",
+        )
+    with col_sort:
+        sort_by = st.selectbox(
+            "Sort Submissions",
+            options=[
+                "Score: Highest to Lowest",
+                "Score: Lowest to Highest",
+                "Submission Time: Newest First",
+                "Student Name: A to Z",
+            ],
+            key=f"sort_res_{selected_exam_id}",
+        )
+
+    # Filter by search query
+    filtered_results = results
+    if search_query and search_query.strip():
+        q_lower = search_query.strip().lower()
+        filtered_results = [
+            r for r in filtered_results
+            if q_lower in r.get("student_name", "").lower() or q_lower in r.get("student_email", "").lower()
+        ]
+
+    # Sort results
+    if sort_by == "Score: Highest to Lowest":
+        filtered_results = sorted(
+            filtered_results,
+            key=lambda r: (r.get("obtained_marks") is not None, r.get("obtained_marks") or 0.0),
+            reverse=True,
+        )
+    elif sort_by == "Score: Lowest to Highest":
+        filtered_results = sorted(
+            filtered_results,
+            key=lambda r: (r.get("obtained_marks") is not None, r.get("obtained_marks") or 0.0),
+        )
+    elif sort_by == "Submission Time: Newest First":
+        filtered_results = sorted(
+            filtered_results,
+            key=lambda r: (r.get("submitted_at") is not None, r.get("submitted_at") or r.get("started_at")),
+            reverse=True,
+        )
+    elif sort_by == "Student Name: A to Z":
+        filtered_results = sorted(
+            filtered_results,
+            key=lambda r: r.get("student_name", "").lower(),
+        )
+
+    st.markdown(f"#### Submissions ({len(filtered_results)} of {len(results)})")
+
+    if not filtered_results:
+        st.warning("No submissions match your search query.")
+        return
+
+    # 6. Roster / Table Rendering
+    table_rows = []
+    for r in filtered_results:
+        time_sec = r.get("time_taken_seconds")
+        if time_sec is not None:
+            mins = time_sec // 60
+            secs = time_sec % 60
+            time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+        else:
+            time_str = "—"
+
+        submitted_dt = r.get("submitted_at")
+        submitted_str = submitted_dt.strftime("%Y-%m-%d %H:%M:%S") if submitted_dt else "In Progress"
+
+        score_str = f"{r['obtained_marks']:.1f} / {r['total_marks']:.1f}" if r.get("obtained_marks") is not None and r.get("total_marks") is not None else "—"
+        pct_str = f"{r['percentage']:.1f}%" if r.get("percentage") is not None else "—"
+
+        table_rows.append({
+            "Attempt #": f"#{r['attempt_id']}",
+            "Student": r.get("student_name", "N/A"),
+            "Email": r.get("student_email", "N/A"),
+            "Score": score_str,
+            "Percentage": pct_str,
+            "Time Taken": time_str,
+            "Submitted At": submitted_str,
+            "Status": r.get("status", "N/A"),
+        })
+
+    st.dataframe(
+        table_rows,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def render_placeholders(teacher_id: int) -> None:
     """
     Render studio control tabs including Create Exam, Manage Exams,
-    Manage Questions, and Publish / Close sections.
+    Manage Questions, Publish / Close, and Exam Results sections.
 
     Args:
         teacher_id: User ID of the authenticated teacher/admin.
     """
     st.subheader("Studio Controls")
 
-    tab_create, tab_manage_exam, tab_manage_q, tab_lifecycle = st.tabs([
+    tab_create, tab_manage_exam, tab_manage_q, tab_lifecycle, tab_results = st.tabs([
         "Create Exam",
         "Manage Exams",
         "Manage Questions",
-        "Publish / Close"
+        "Publish / Close",
+        "Exam Results",
     ])
 
     with tab_create:
@@ -729,6 +919,9 @@ def render_placeholders(teacher_id: int) -> None:
 
     with tab_lifecycle:
         render_lifecycle_section(teacher_id)
+
+    with tab_results:
+        render_exam_results_section(teacher_id)
 
 
 def render_teacher_ui() -> None:
