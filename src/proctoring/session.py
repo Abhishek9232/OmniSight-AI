@@ -3,12 +3,19 @@ OmniSight-AI Proctoring Session Coordinator.
 Encapsulates face detection, temporal state tracking, and event persistence for an attempt.
 Enforces complete failure isolation: perception or database errors never bubble up
 to interrupt the student or examination workflow.
+
+Temporal Precision & Latency:
+- Frame sampling operates at approximately 1 FPS (~1.0s interval).
+- State continuity calculations use time.monotonic() to eliminate wall-clock drift.
+- The temporal detection precision of sustained events (5s absence, 3s multiple faces)
+  is approximately bounded by the sampling interval (± ~1.0s).
 """
 
 from typing import Optional, Dict, Any
 from src.proctoring.detector import FaceDetector
 from src.proctoring.state import ProctoringStateTracker
 from src.proctoring.service import record_monitoring_event
+from src.proctoring.adapter import FrameInputAdapter, NullFrameAdapter
 
 
 class ProctoringSession:
@@ -23,6 +30,7 @@ class ProctoringSession:
         attempt_id: int,
         detector: Optional[FaceDetector] = None,
         tracker: Optional[ProctoringStateTracker] = None,
+        frame_adapter: Optional[FrameInputAdapter] = None,
     ) -> None:
         """
         Initialize a proctoring session for a given attempt.
@@ -31,6 +39,7 @@ class ProctoringSession:
             attempt_id: Target exam attempt ID.
             detector: Optional pre-configured FaceDetector instance (instantiates default if None).
             tracker: Optional pre-configured ProctoringStateTracker instance (instantiates default if None).
+            frame_adapter: Optional FrameInputAdapter instance (defaults to NullFrameAdapter if None).
         """
         if not isinstance(attempt_id, int) or attempt_id <= 0:
             raise ValueError("Valid attempt_id must be a positive integer.")
@@ -38,6 +47,7 @@ class ProctoringSession:
         self.attempt_id = attempt_id
         self.detector = detector if detector is not None else FaceDetector()
         self.tracker = tracker if tracker is not None else ProctoringStateTracker()
+        self.frame_adapter = frame_adapter if frame_adapter is not None else NullFrameAdapter()
         self._is_active = True
 
     @property
@@ -151,6 +161,79 @@ class ProctoringSession:
                 "error": f"Proctoring session processing failure: {str(e)}",
             }
 
+    def process_sample(self, timestamp: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Acquire a frame from the configured frame_adapter and process it.
+        If no frame is available or adapter reports unavailable, returns safely with zero side effects.
+
+        Args:
+            timestamp: Monotonic timestamp (float seconds).
+
+        Returns:
+            Dict conforming to execution contract.
+        """
+        if not self._is_active:
+            return {
+                "success": False,
+                "face_count": 0,
+                "faces": [],
+                "state": self.tracker.current_state,
+                "event_emitted": False,
+                "event": None,
+                "persistence_result": None,
+                "recovery": False,
+                "recovery_info": None,
+                "error": "ProctoringSession is closed.",
+            }
+
+        try:
+            if not self.frame_adapter.is_available():
+                return {
+                    "success": True,
+                    "face_count": 0,
+                    "faces": [],
+                    "state": self.tracker.current_state,
+                    "event_emitted": False,
+                    "event": None,
+                    "persistence_result": None,
+                    "recovery": False,
+                    "recovery_info": None,
+                    "error": None,
+                    "skipped": True,
+                }
+
+            frame = self.frame_adapter.get_frame()
+            if frame is None:
+                return {
+                    "success": True,
+                    "face_count": 0,
+                    "faces": [],
+                    "state": self.tracker.current_state,
+                    "event_emitted": False,
+                    "event": None,
+                    "persistence_result": None,
+                    "recovery": False,
+                    "recovery_info": None,
+                    "error": None,
+                    "skipped": True,
+                }
+
+            return self.process_frame(frame, timestamp=timestamp)
+
+        except Exception as e:
+            return {
+                "success": False,
+                "face_count": 0,
+                "faces": [],
+                "state": self.tracker.current_state,
+                "event_emitted": False,
+                "event": None,
+                "persistence_result": None,
+                "recovery": False,
+                "recovery_info": None,
+                "error": f"Adapter sampling error: {str(e)}",
+            }
+
     def reset(self) -> None:
         """Reset the internal state tracker."""
         self.tracker.reset()
@@ -158,3 +241,7 @@ class ProctoringSession:
     def close(self) -> None:
         """Close the session and prevent further frame processing."""
         self._is_active = False
+
+    def stop(self) -> None:
+        """Stop and close the session (alias for close)."""
+        self.close()

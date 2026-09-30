@@ -1,7 +1,7 @@
 """
 OmniSight-AI Proctoring Subsystem Package.
 Provides computer-vision-based examination monitoring, temporal state tracking,
-and transaction-safe event persistence.
+transaction-safe event persistence, and frame input adapters.
 """
 
 from src.proctoring.detector import FaceDetector
@@ -20,12 +20,20 @@ from src.proctoring.service import (
     get_attempt_monitoring_events,
     get_monitoring_event_summary,
 )
+from src.proctoring.adapter import (
+    FrameInputAdapter,
+    NullFrameAdapter,
+    SimulatedFrameAdapter,
+)
 from src.proctoring.session import ProctoringSession
 
 __all__ = [
     "FaceDetector",
     "ProctoringStateTracker",
     "ProctoringSession",
+    "FrameInputAdapter",
+    "NullFrameAdapter",
+    "SimulatedFrameAdapter",
     "record_monitoring_event",
     "get_attempt_monitoring_events",
     "get_monitoring_event_summary",

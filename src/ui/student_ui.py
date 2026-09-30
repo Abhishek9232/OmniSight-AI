@@ -5,6 +5,7 @@ inspect exam instructions, and initiate assessment attempts.
 """
 
 from datetime import datetime, timedelta
+import time
 from typing import Optional, Dict, Any, List
 import streamlit as st
 import streamlit.components.v1 as components
@@ -23,6 +24,40 @@ from src.exam.service import (
     get_attempt_result,
     get_attempt_scorecard_details,
 )
+from src.proctoring.session import ProctoringSession
+from src.proctoring.adapter import NullFrameAdapter, FrameInputAdapter
+
+
+def _get_or_create_proctoring_session(attempt_id: int) -> ProctoringSession:
+    """
+    Retrieve an active ProctoringSession from st.session_state, or instantiate
+    a new one associated with the given attempt_id if not present.
+    """
+    key = f"proctoring_session_{attempt_id}"
+    if key not in st.session_state:
+        adapter = st.session_state.get(f"proctoring_adapter_{attempt_id}")
+        st.session_state[key] = ProctoringSession(attempt_id=attempt_id, frame_adapter=adapter)
+    return st.session_state[key]
+
+
+def _cleanup_proctoring_session(attempt_id: Optional[int]) -> None:
+    """
+    Gracefully terminate and unregister the ProctoringSession for an attempt
+    upon submission, cancellation, or hard cutoff finalization.
+    """
+    if attempt_id is None:
+        return
+    key = f"proctoring_session_{attempt_id}"
+    if key in st.session_state:
+        session = st.session_state.get(key)
+        if session and hasattr(session, "stop"):
+            try:
+                session.stop()
+            except Exception:
+                pass
+        st.session_state.pop(key, None)
+    st.session_state.pop(f"proctoring_adapter_{attempt_id}", None)
+    st.session_state.pop(f"proctoring_last_sample_{attempt_id}", None)
 
 
 def render_student_header(user: Dict[str, Any]) -> None:
@@ -46,6 +81,9 @@ def render_student_header(user: Dict[str, Any]) -> None:
         else:
             st.caption(f"Role: **{role_label}**")
         if st.button("Log Out", key="student_logout_btn"):
+            active_att = st.session_state.get("active_attempt_id")
+            if active_att:
+                _cleanup_proctoring_session(active_att)
             logout()
             st.rerun()
 
@@ -217,8 +255,10 @@ def render_exam_instructions(student_id: int, exam_id: Optional[int]) -> None:
                 else:
                     try:
                         attempt = start_attempt(exam_id=exam_id, student_id=student_id)
-                        st.session_state["active_attempt_id"] = attempt["attempt_id"]
+                        attempt_id = attempt["attempt_id"]
+                        st.session_state["active_attempt_id"] = attempt_id
                         st.session_state["active_exam_id"] = exam_id
+                        _get_or_create_proctoring_session(attempt_id)
                         st.session_state["student_view"] = "active_exam"
                         st.session_state["student_flash_msg"] = (
                             f"Examination '{exam.get('title')}' started successfully!"
@@ -496,12 +536,14 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
 
     attempt_status = attempt.get("status")
     if attempt_status in {"SUBMITTED", "EVALUATED"}:
+        _cleanup_proctoring_session(attempt_id)
         st.session_state["view_result_attempt_id"] = attempt_id
         st.session_state["student_view"] = "result"
         st.rerun()
         return
 
     if attempt_status != "IN_PROGRESS":
+        _cleanup_proctoring_session(attempt_id)
         st.error(f"Examination attempt has invalid status '{attempt_status}'.")
         if st.button("Return to Catalog", key="invalid_status_btn"):
             st.session_state["student_view"] = "catalog"
@@ -537,6 +579,7 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
 
     # Hard cutoff: only past the 60-second grace window
     if now > grace_deadline:
+        _cleanup_proctoring_session(attempt_id)
         auto_submit_key = f"auto_submit_handled_{attempt_id}"
         if not st.session_state.get(auto_submit_key, False):
             st.session_state[auto_submit_key] = True
@@ -557,6 +600,19 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
     remaining_seconds = int((official_deadline - now).total_seconds())
     grace_remaining_seconds = max(0, int((grace_deadline - now).total_seconds()))
     in_grace_window = (now > official_deadline) and (now <= grace_deadline)
+
+    # Rate-throttled proctoring sampling at ~1 FPS during active attempt (including grace window)
+    proc_session = _get_or_create_proctoring_session(attempt_id)
+    now_mono = time.monotonic()
+    last_sample_key = f"proctoring_last_sample_{attempt_id}"
+    last_sample_time = st.session_state.get(last_sample_key, 0.0)
+    if (now_mono - last_sample_time) >= 1.0:
+        st.session_state[last_sample_key] = now_mono
+        try:
+            proc_session.process_sample(timestamp=now_mono)
+        except Exception:
+            # Failure isolation: monitoring exceptions must never crash student exam flow
+            pass
 
     try:
         questions = get_attempt_questions(attempt_id, student_id)
@@ -652,6 +708,7 @@ def render_active_exam(student_id: int, attempt_id: Optional[int]) -> None:
 
     if in_grace_window:
         if st.button("Finalize & Submit Exam Now", key=f"grace_submit_{attempt_id}", type="primary", use_container_width=True):
+            _cleanup_proctoring_session(attempt_id)
             try:
                 submit_attempt(attempt_id, student_id)
                 evaluate_attempt(attempt_id, student_id)
@@ -841,12 +898,14 @@ def render_exam_review(student_id: int, attempt_id: Optional[int]) -> None:
 
     attempt_status = attempt.get("status")
     if attempt_status in {"SUBMITTED", "EVALUATED"}:
+        _cleanup_proctoring_session(attempt_id)
         st.session_state["view_result_attempt_id"] = attempt_id
         st.session_state["student_view"] = "result"
         st.rerun()
         return
 
     if attempt_status != "IN_PROGRESS":
+        _cleanup_proctoring_session(attempt_id)
         st.error(f"Examination attempt has invalid status '{attempt_status}'.")
         if st.button("Return to Catalog", key="invalid_status_review_btn"):
             st.session_state["student_view"] = "catalog"
@@ -882,6 +941,7 @@ def render_exam_review(student_id: int, attempt_id: Optional[int]) -> None:
 
     # Hard cutoff: only past the 60-second grace window
     if now > grace_deadline:
+        _cleanup_proctoring_session(attempt_id)
         auto_submit_key = f"auto_submit_handled_{attempt_id}"
         if not st.session_state.get(auto_submit_key, False):
             st.session_state[auto_submit_key] = True
@@ -902,6 +962,19 @@ def render_exam_review(student_id: int, attempt_id: Optional[int]) -> None:
     remaining_seconds = int((official_deadline - now).total_seconds())
     grace_remaining_seconds = max(0, int((grace_deadline - now).total_seconds()))
     in_grace_window = (now > official_deadline) and (now <= grace_deadline)
+
+    # Rate-throttled proctoring sampling at ~1 FPS during review (attempt is still IN_PROGRESS)
+    proc_session = _get_or_create_proctoring_session(attempt_id)
+    now_mono = time.monotonic()
+    last_sample_key = f"proctoring_last_sample_{attempt_id}"
+    last_sample_time = st.session_state.get(last_sample_key, 0.0)
+    if (now_mono - last_sample_time) >= 1.0:
+        st.session_state[last_sample_key] = now_mono
+        try:
+            proc_session.process_sample(timestamp=now_mono)
+        except Exception:
+            # Failure isolation: monitoring exceptions must never crash student review flow
+            pass
 
     try:
         questions = get_attempt_questions(attempt_id, student_id)
@@ -1063,6 +1136,7 @@ def render_exam_review(student_id: int, attempt_id: Optional[int]) -> None:
             disabled=submit_disabled,
             use_container_width=True,
         ):
+            _cleanup_proctoring_session(attempt_id)
             try:
                 submit_attempt(attempt_id, student_id)
             except ValueError as e:
@@ -1125,6 +1199,8 @@ def render_result_view(student_id: int, attempt_id: Optional[int]) -> None:
             st.session_state["view_result_attempt_id"] = None
             st.rerun()
         return
+
+    _cleanup_proctoring_session(attempt_id)
 
     # Retrieve scorecard details directly (read-only query)
     scorecard = None
