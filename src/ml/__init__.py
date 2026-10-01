@@ -13,6 +13,11 @@ from src.ml.contract import (
     validate_feature_vector,
     validate_features,
 )
+from src.ml.dataset import (
+    MLDataset,
+    assemble_feature_matrix,
+    assemble_from_database,
+)
 
 __all__ = [
     "FEATURE_SCHEMA_VERSION",
@@ -24,4 +29,7 @@ __all__ = [
     "validate_feature_dict",
     "validate_feature_vector",
     "validate_features",
+    "MLDataset",
+    "assemble_feature_matrix",
+    "assemble_from_database",
 ]
